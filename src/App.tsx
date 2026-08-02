@@ -59,8 +59,8 @@ function App() {
   const [functions, setFunctions] = useState(initialFunctions)
   const [selectedIds, setSelectedIds] = useState<string[]>(['f'])
   const [view, setView] = useState<View>({ x: 0, y: 0, scale: 54 })
-  const [notice, setNotice] = useState('选择曲线后，拖动控制柄来变换它。')
-  const [drag, setDrag] = useState<{ mode: 'pan' | 'move' | 'scale'; startX: number; startY: number; view: View; transform?: Transform } | null>(null)
+  const [notice, setNotice] = useState('直接拖动曲线即可平移函数；拖动空白处可平移画布。')
+  const [drag, setDrag] = useState<{ mode: 'pan' | 'move'; startX: number; startY: number; view: View; targetId?: string; transform?: Transform } | null>(null)
 
   const selected = functions.filter((item) => selectedIds.includes(item.id))
   const primary = selected[0]
@@ -111,6 +111,19 @@ function App() {
       }
       context.stroke()
       context.globalAlpha = 1
+
+      if (isSelected) {
+        const handleX = originX + view.scale
+        const input = item.transform.xScale * (1 - item.transform.horizontal)
+        const rawY = item.derivative ? derivative(item.expression)(input) : evaluate(item.expression, input)
+        const handleY = originY - (item.transform.yScale * rawY + item.transform.vertical) * view.scale
+        if (Number.isFinite(handleY) && handleY > 12 && handleY < height - 12) {
+          context.fillStyle = '#fffdf8'
+          context.strokeStyle = item.color
+          context.lineWidth = 2
+          context.beginPath(); context.arc(handleX, handleY, 6, 0, Math.PI * 2); context.fill(); context.stroke()
+        }
+      }
     })
   }, [functions, selectedIds, view])
 
@@ -141,14 +154,37 @@ function App() {
     context.beginPath(); context.moveTo(x1, y1); context.lineTo(x2, y2); context.stroke()
   }
 
-  function updatePrimary(update: (item: FunctionItem) => FunctionItem) {
-    if (!primary) return
-    setFunctions((current) => current.map((item) => item.id === primary.id ? update(item) : item))
+  function getFunctionAt(clientX: number, clientY: number) {
+    const host = hostRef.current
+    if (!host) return undefined
+    const rect = host.getBoundingClientRect()
+    const pixelX = clientX - rect.left
+    const pixelY = clientY - rect.top
+    const originX = rect.width / 2 + view.x
+    const originY = rect.height / 2 + view.y
+    const x = (pixelX - originX) / view.scale
+    let closest: { item: FunctionItem; distance: number } | undefined
+    for (const item of functions) {
+      const input = item.transform.xScale * (x - item.transform.horizontal)
+      const rawY = item.derivative ? derivative(item.expression)(input) : evaluate(item.expression, input)
+      const y = item.transform.yScale * rawY + item.transform.vertical
+      const curveY = originY - y * view.scale
+      const distance = Math.abs(curveY - pixelY)
+      if (Number.isFinite(distance) && distance < 16 && (!closest || distance < closest.distance)) closest = { item, distance }
+    }
+    return closest?.item
   }
 
-  function beginDrag(event: React.PointerEvent<HTMLElement>, mode: 'pan' | 'move' | 'scale') {
+  function beginCanvasDrag(event: React.PointerEvent<HTMLDivElement>) {
     event.currentTarget.setPointerCapture(event.pointerId)
-    setDrag({ mode, startX: event.clientX, startY: event.clientY, view, transform: primary?.transform })
+    const hit = getFunctionAt(event.clientX, event.clientY)
+    if (hit) {
+      setSelectedIds([hit.id])
+      setNotice(`正在移动 ${hit.name}(x)：松开即可保留这个变换。`)
+      setDrag({ mode: 'move', startX: event.clientX, startY: event.clientY, view, targetId: hit.id, transform: hit.transform })
+      return
+    }
+    setDrag({ mode: 'pan', startX: event.clientX, startY: event.clientY, view })
   }
 
   function movePointer(event: React.PointerEvent<HTMLDivElement>) {
@@ -156,13 +192,7 @@ function App() {
     const dx = event.clientX - drag.startX
     const dy = event.clientY - drag.startY
     if (drag.mode === 'pan') setView({ ...drag.view, x: drag.view.x + dx, y: drag.view.y + dy })
-    if (drag.mode === 'move' && drag.transform) {
-      updatePrimary((item) => ({ ...item, transform: { ...drag.transform!, horizontal: drag.transform!.horizontal + dx / view.scale, vertical: drag.transform!.vertical - dy / view.scale } }))
-    }
-    if (drag.mode === 'scale' && drag.transform) {
-      const factor = Math.max(0.2, Math.min(5, 1 + (dx - dy) / 250))
-      updatePrimary((item) => ({ ...item, transform: { ...drag.transform!, xScale: drag.transform!.xScale * factor, yScale: drag.transform!.yScale * factor } }))
-    }
+    if (drag.mode === 'move' && drag.transform && drag.targetId) setFunctions((current) => current.map((item) => item.id === drag.targetId ? { ...item, transform: { ...drag.transform!, horizontal: drag.transform!.horizontal + dx / drag.view.scale, vertical: drag.transform!.vertical - dy / drag.view.scale } } : item))
   }
 
   function addFunction() {
@@ -202,26 +232,21 @@ function App() {
       </aside>
 
       <section className="canvas-area" aria-label="函数图像画布">
-        <div className="canvas-host" ref={hostRef} onPointerDown={(event) => beginDrag(event, 'pan')} onPointerMove={movePointer} onPointerUp={() => setDrag(null)} onPointerCancel={() => setDrag(null)}>
+        <div className="canvas-host" ref={hostRef} onPointerDown={beginCanvasDrag} onPointerMove={movePointer} onPointerUp={() => setDrag(null)} onPointerCancel={() => setDrag(null)}>
           <canvas ref={canvasRef} />
-          {primary && <div className="transform-hud" onPointerDown={(event) => event.stopPropagation()}>
-            <span className="hud-label">已选 {primary.name}(x)</span>
-            <button type="button" onPointerDown={(event) => beginDrag(event, 'move')} aria-label="拖动以平移函数">移动 <i>↕</i></button>
-            <button type="button" onPointerDown={(event) => beginDrag(event, 'scale')} aria-label="拖动以缩放函数">缩放 <i>⤢</i></button>
-          </div>}
           <p className="canvas-note">{notice}</p>
         </div>
         <div className="floating-toolbar" aria-label="函数操作">
           <button type="button" disabled={!primary} onClick={addDerivative}>求导</button>
           <button type="button" disabled={selected.length !== 2} onClick={() => setNotice('函数组合将在下一步接入符号运算引擎。')}>组合</button>
-          <button type="button" disabled={!primary} onClick={() => setNotice('请选择“移动”或“缩放”控制柄，变换会反映到公式。')}>变换</button>
+          <button type="button" disabled={!primary} onClick={() => setNotice('直接拖动已选曲线即可移动它。白色圆点标记了曲线的可见控制点。')}>变换</button>
           <button type="button" disabled={!primary} onClick={() => setNotice('分析功能将在符号引擎接入后提供。')}>分析</button>
         </div>
       </section>
 
       <aside className="inspector" aria-label="所选函数属性">
         <p className="eyebrow">当前对象</p>
-        {primary ? <><h1>{primary.name}(x)</h1><p className="expression-large">{primary.expression}</p><div className="rule" /><p className="eyebrow">图形变换</p><dl><dt>水平平移</dt><dd>{format(primary.transform.horizontal)}</dd><dt>垂直平移</dt><dd>{format(primary.transform.vertical)}</dd><dt>水平缩放</dt><dd>{format(primary.transform.xScale)}</dd><dt>垂直缩放</dt><dd>{format(primary.transform.yScale)}</dd></dl><p className="hint">在画布内拖动“移动”或“缩放”控制柄，所有数值都会即时更新。</p></> : <p>选择一条函数查看属性。</p>}
+        {primary ? <><h1>{primary.name}(x)</h1><p className="expression-large">{transformExpression(primary)}</p><div className="rule" /><p className="eyebrow">图形变换</p><dl><dt>水平平移</dt><dd>{format(primary.transform.horizontal)}</dd><dt>垂直平移</dt><dd>{format(primary.transform.vertical)}</dd><dt>水平缩放</dt><dd>{format(primary.transform.xScale)}</dd><dt>垂直缩放</dt><dd>{format(primary.transform.yScale)}</dd></dl><p className="hint">直接按住曲线拖动即可平移函数；按住空白处拖动才会移动坐标系。</p></> : <p>选择一条函数查看属性。</p>}
       </aside>
     </section>
   </main>
