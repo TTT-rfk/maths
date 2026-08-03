@@ -472,6 +472,19 @@ function App() {
         <p className="eyebrow">当前对象</p>
         {selected ? <>
           <h1>{selected.name}(x)</h1><p className="expression-large">{selected.expression} + 控制点变形</p>
+          <div className="explanation-card">
+            <strong>这条曲线是怎样变化的？</strong>
+            {mode === 'freeform' ? <>
+              <p>棉线模式把曲线看成许多首尾相连的小点。拖动白点时，附近的小点也会跟着移动，越远影响越小。</p>
+              <p className="formula-line">位移 = y₀ × (1 − r²)³</p>
+              <p>这里的 <b>y₀</b> 是白点移动的距离，<b>r</b> 是“距离白点有多远”。当 r=0 时白点移动最多；当 r=1 时影响变成 0，所以曲线可以平滑接回原来的位置。</p>
+            </> : <>
+              <p>数学约束模式也操作同一条曲线，但影响范围更宽，让函数在较大范围内平滑变化。</p>
+              <p className="formula-line">位移 = y₀ × (1 − r)⁴ × (1 + 4r)</p>
+              <p>白点附近变化明显，远离白点后逐渐恢复。这个式子是画布的平滑近似，不是原函数的新的解析式。</p>
+            </>}
+            <p className="explanation-note">横坐标保持不变，所以曲线仍然可以看成 y=f(x)，也可以继续取值和计算某一点的导数。</p>
+          </div>
           {expressionParameters(selected.expression).length > 0 && <><div className="rule" /><p className="eyebrow">自由参数</p><div className="parameter-list">{expressionParameters(selected.expression).map((name) => <label key={name}><span>{name}</span><input type="range" min="-10" max="10" step="0.1" value={selected.parameters[name] ?? 1} onChange={(event) => updateParameter(name, Number(event.target.value))} /><input type="number" step="0.1" value={selected.parameters[name] ?? 1} onChange={(event) => updateParameter(name, Number(event.target.value))} /></label>)}</div></>}
           <div className="rule" /><p className="eyebrow">拖拽模式</p>
           <div className="mode-switch"><button className={mode === 'constraint' ? 'active' : ''} type="button" onClick={() => switchMode('constraint')}>1 数学约束</button><button className={mode === 'freeform' ? 'active' : ''} type="button" onClick={() => switchMode('freeform')}>3 棉线张力</button></div>
