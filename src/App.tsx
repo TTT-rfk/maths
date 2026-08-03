@@ -62,21 +62,39 @@ function baseValue(item: FunctionItem, x: number) {
   return item.transform.yScale * rawY + item.transform.vertical
 }
 
+function solveSystem(matrix: number[][], values: number[]) {
+  const size = values.length
+  const augmented = matrix.map((row, index) => [...row, values[index]])
+  for (let column = 0; column < size; column += 1) {
+    let pivot = column
+    for (let row = column + 1; row < size; row += 1) if (Math.abs(augmented[row][column]) > Math.abs(augmented[pivot][column])) pivot = row
+    if (Math.abs(augmented[pivot][column]) < 0.000001) return values.map(() => 0)
+    ;[augmented[column], augmented[pivot]] = [augmented[pivot], augmented[column]]
+    const divisor = augmented[column][column]
+    for (let cell = column; cell <= size; cell += 1) augmented[column][cell] /= divisor
+    for (let row = 0; row < size; row += 1) {
+      if (row === column) continue
+      const factor = augmented[row][column]
+      for (let cell = column; cell <= size; cell += 1) augmented[row][cell] -= factor * augmented[column][cell]
+    }
+  }
+  return augmented.map((row) => row[size])
+}
+
 function functionValue(item: FunctionItem, x: number) {
   const points = [...item.anchors, ...item.edits]
   if (!points.length) return baseValue(item, x)
-  const radius = 1.8
-  const contributions = points.map((point) => {
-    const distance = Math.abs(x - point.x)
-    if (distance < 0.00001) return { point, weight: 1, exact: true }
-    const t = Math.max(0, 1 - distance / radius)
-    return { point, weight: t * t * (3 - 2 * t), exact: false }
-  })
-  const exact = contributions.find((entry) => entry.exact)
-  if (exact) return exact.point.y
-  const totalWeight = contributions.reduce((total, entry) => total + entry.weight, 0)
-  if (totalWeight < 0.00001) return baseValue(item, x)
-  return baseValue(item, x) + contributions.reduce((total, entry) => total + (entry.point.y - baseValue(item, entry.point.x)) * entry.weight, 0) / totalWeight
+  const radius = 2.4
+  // A compact C2 radial basis is exactly interpolating but fades smoothly to zero.
+  const kernel = (a: number, b: number) => {
+    const distance = Math.abs(a - b) / radius
+    if (distance >= 1) return 0
+    const tail = 1 - distance
+    return tail ** 4 * (4 * distance + 1)
+  }
+  const matrix = points.map((point, row) => points.map((other, column) => kernel(point.x, other.x) + (row === column ? 0.000001 : 0)))
+  const weights = solveSystem(matrix, points.map((point) => point.y - baseValue(item, point.x)))
+  return baseValue(item, x) + points.reduce((total, point, index) => total + weights[index] * kernel(x, point.x), 0)
 }
 
 function App() {
