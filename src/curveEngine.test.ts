@@ -58,7 +58,11 @@ describe('curve engine', () => {
     const leftRise = deformed[grabbed].y - deformed[grabbed - 1].y
     const rightRise = deformed[grabbed].y - deformed[grabbed + 1].y
     expect(leftRise).toBeCloseTo(rightRise, 3)
-    expect(Math.abs(leftRise)).toBeLessThan(0.2)
+    expect(Math.abs(leftRise)).toBeLessThan(0.02)
+    const leftCurvature = deformed[grabbed].y - 2 * deformed[grabbed - 1].y + deformed[grabbed - 2].y
+    const rightCurvature = deformed[grabbed + 2].y - 2 * deformed[grabbed + 1].y + deformed[grabbed].y
+    expect(leftCurvature).toBeCloseTo(rightCurvature, 4)
+    expect(Math.abs(leftCurvature)).toBeLessThan(0.02)
   })
 
   it('does not move a disconnected segment near the rope cap', () => {
@@ -92,6 +96,15 @@ describe('curve engine', () => {
     expect(second[firstIndex]).toEqual(first[firstIndex])
     expect(second[secondIndex].y).toBeGreaterThan(first[secondIndex].y)
     expect(second[secondIndex].y).toBeGreaterThan(original[secondIndex].y)
+  })
+
+  it('stops rope displacement at a pinned control point', () => {
+    const curve = createFreeCurve(item)
+    const grabbed = Math.floor(curve.length / 2)
+    const pin = grabbed + 25
+    const result = deformFreeCurve(curve, grabbed, 3, [pin])
+    expect(result[pin]).toEqual(curve[pin])
+    expect(result.slice(pin + 1, grabbed + 52)).toEqual(curve.slice(pin + 1, grabbed + 52))
   })
 
   it('samples values and point derivatives from the current deformed curve', () => {

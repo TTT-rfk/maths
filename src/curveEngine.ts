@@ -67,32 +67,25 @@ export function createFreeCurve(item: FunctionItem, minX = -20, maxX = 20) {
 export function deformFreeCurve(curve: CurvePoint[], grabbedIndex: number, dy: number, pinnedIndices: number[] = []) {
   const radius = 52
   const grabbedSegment = curve[grabbedIndex].segment
-  const displacements = curve.map(() => 0)
-  const fixed = new Map<number, number>([[grabbedIndex, dy], ...pinnedIndices.map((index) => [index, 0] as const)])
-  const capRadius = 4
-  for (let offset = 1; offset <= capRadius; offset += 1) {
-    const capDisplacement = dy * Math.cos((Math.PI * offset) / (2 * (capRadius + 1)))
-    const left = grabbedIndex - offset
-    const right = grabbedIndex + offset
-    if (curve[left]?.segment === grabbedSegment && !fixed.has(left)) fixed.set(left, capDisplacement)
-    if (curve[right]?.segment === grabbedSegment && !fixed.has(right)) fixed.set(right, capDisplacement)
-  }
   const start = Math.max(0, grabbedIndex - radius)
   const end = Math.min(curve.length - 1, grabbedIndex + radius)
-
-  // Position-based relaxation: neighboring particles repeatedly share displacement.
-  for (let pass = 0; pass < 140; pass += 1) {
-    const previous = [...displacements]
-    for (let index = start + 1; index < end; index += 1) {
-      if (curve[index].segment !== grabbedSegment || fixed.has(index)) continue
-      displacements[index] = previous[index] * 0.25 + (previous[index - 1] + previous[index + 1]) * 0.375
+  const smoothStep = (value: number) => value * value * (3 - 2 * value)
+  return curve.map((point, index) => {
+    if (index < start || index > end || point.segment !== grabbedSegment) return point
+    const normalizedDistance = Math.abs(index - grabbedIndex) / radius
+    if (normalizedDistance >= 1) return point
+    // Compact C2 elastic profile: flat at the handle and smooth at the support boundary.
+    let weight = (1 - normalizedDistance * normalizedDistance) ** 3
+    for (const pin of pinnedIndices) {
+      const beyondPin = (pin - grabbedIndex) * (index - pin) > 0
+      if (beyondPin) return point
+      const pinDistance = Math.abs(index - pin)
+      const pinRadius = 20
+      if (pinDistance >= pinRadius) continue
+      weight *= smoothStep(pinDistance / pinRadius)
     }
-    for (const [index, value] of fixed) displacements[index] = value
-    if (!fixed.has(start)) displacements[start] = 0
-    if (!fixed.has(end)) displacements[end] = 0
-  }
-
-  return curve.map((point, index) => ({ ...point, y: point.y + displacements[index] }))
+    return { ...point, y: point.y + dy * weight }
+  })
 }
 
 export function deformConstraintCurve(curve: CurvePoint[], grabbedIndex: number, dy: number, pinnedIndices: number[] = []) {
