@@ -11,15 +11,23 @@ export type FunctionItem = {
   color: string
   transform: Transform
   derivative?: boolean
+  parameters: Record<string, number>
   freeCurve: CurvePoint[] | null
-  freeAnchors: { id: string; index: number }[]
+  freeAnchors: { id: string; index: number; infinity?: 1 | -1 }[]
 }
 
-export function evaluate(expression: string, x: number) {
-  const source = expression
+const builtInNames = new Set(['x', 'sin', 'cos', 'tan', 'sqrt', 'abs', 'exp', 'log', 'pi', 'e', 'math'])
+
+export function expressionParameters(expression: string) {
+  return [...new Set(expression.toLowerCase().match(/[a-z_]\w*/g) ?? [])].filter((name) => !builtInNames.has(name))
+}
+
+export function evaluate(expression: string, x: number, parameters: Record<string, number> = {}) {
+  let source = expression
     .trim().toLowerCase().replaceAll('π', 'pi').replaceAll('^', '**')
     .replace(/\bpi\b/g, 'Math.PI').replace(/\be\b/g, 'Math.E')
     .replace(/\b(sin|cos|tan|sqrt|abs|exp|log)\s*\(/g, 'Math.$1(')
+  for (const [name, value] of Object.entries(parameters)) source = source.replace(new RegExp(`\\b${name.toLowerCase()}\\b`, 'g'), `(${value})`)
   const remaining = source.replace(/Math\.(?:PI|E|sin|cos|tan|sqrt|abs|exp|log)/g, '')
   if (!/^[\d\s+x*/().,-]+$/.test(remaining)) return Number.NaN
   try {
@@ -30,14 +38,14 @@ export function evaluate(expression: string, x: number) {
   }
 }
 
-function derivativeValue(expression: string, x: number) {
+function derivativeValue(expression: string, x: number, parameters: Record<string, number>) {
   const h = Math.max(0.00001, Math.abs(x) * 0.00001)
-  return (evaluate(expression, x + h) - evaluate(expression, x - h)) / (2 * h)
+  return (evaluate(expression, x + h, parameters) - evaluate(expression, x - h, parameters)) / (2 * h)
 }
 
 export function baseValue(item: FunctionItem, x: number) {
   const input = item.transform.xScale * (x - item.transform.horizontal)
-  const rawY = item.derivative ? derivativeValue(item.expression, input) : evaluate(item.expression, input)
+  const rawY = item.derivative ? derivativeValue(item.expression, input, item.parameters) : evaluate(item.expression, input, item.parameters)
   return item.transform.yScale * rawY + item.transform.vertical
 }
 
@@ -61,6 +69,14 @@ export function deformFreeCurve(curve: CurvePoint[], grabbedIndex: number, dy: n
   const grabbedSegment = curve[grabbedIndex].segment
   const displacements = curve.map(() => 0)
   const fixed = new Map<number, number>([[grabbedIndex, dy], ...pinnedIndices.map((index) => [index, 0] as const)])
+  const capRadius = 4
+  for (let offset = 1; offset <= capRadius; offset += 1) {
+    const capDisplacement = dy * Math.cos((Math.PI * offset) / (2 * (capRadius + 1)))
+    const left = grabbedIndex - offset
+    const right = grabbedIndex + offset
+    if (curve[left]?.segment === grabbedSegment && !fixed.has(left)) fixed.set(left, capDisplacement)
+    if (curve[right]?.segment === grabbedSegment && !fixed.has(right)) fixed.set(right, capDisplacement)
+  }
   const start = Math.max(0, grabbedIndex - radius)
   const end = Math.min(curve.length - 1, grabbedIndex + radius)
 
@@ -110,7 +126,7 @@ export function sampleCurve(curve: CurvePoint[], x: number): CurveSample | null 
   }
   const right = Math.min(curve.length - 1, low)
   const left = Math.max(0, right - 1)
-  if (curve[left].segment !== curve[right].segment || x < curve[left].x || x > curve[right].x) return null
+  if (curve[left].segment !== curve[right].segment || !Number.isFinite(curve[left].y) || !Number.isFinite(curve[right].y) || x < curve[left].x || x > curve[right].x) return null
   const span = curve[right].x - curve[left].x
   if (span <= 0) return null
   const ratio = (x - curve[left].x) / span
@@ -122,6 +138,21 @@ export function sampleCurve(curve: CurvePoint[], x: number): CurveSample | null 
     ? (curve[derivativeRight].y - curve[derivativeLeft].y) / (curve[derivativeRight].x - curve[derivativeLeft].x)
     : segmentDerivative
   return { x, y: curve[left].y + (curve[right].y - curve[left].y) * ratio, derivative, index, segment: curve[left].segment }
+}
+
+export function curveWithInfinity(curve: CurvePoint[], anchors: FunctionItem['freeAnchors']) {
+  const result = curve.map((point) => ({ ...point }))
+  for (const anchor of anchors.filter((point) => point.infinity)) {
+    const center = curve[anchor.index]
+    if (!center) continue
+    const width = 1.2
+    for (let index = 0; index < result.length; index += 1) {
+      const ratio = Math.abs(result[index].x - center.x) / width
+      if (result[index].segment !== center.segment || ratio >= 1) continue
+      result[index].y = ratio < 0.000001 ? anchor.infinity! * Number.POSITIVE_INFINITY : result[index].y + anchor.infinity! * 0.12 * ((1 / (ratio * ratio)) - 1) * ((1 - ratio) ** 2)
+    }
+  }
+  return result
 }
 
 export function nearestCurvePoint(curve: CurvePoint[], x: number, y: number, scale: number) {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createFreeCurve, deformConstraintCurve, deformFreeCurve, sampleCurve, type FunctionItem } from './curveEngine'
+import { createFreeCurve, curveWithInfinity, deformConstraintCurve, deformFreeCurve, evaluate, expressionParameters, sampleCurve, type FunctionItem } from './curveEngine'
 
 const item: FunctionItem = {
   id: 'f',
@@ -7,6 +7,7 @@ const item: FunctionItem = {
   expression: 'x^2 - 2',
   color: '#000',
   transform: { horizontal: 0, vertical: 0, xScale: 1, yScale: 1 },
+  parameters: {},
   freeCurve: null,
   freeAnchors: [],
 }
@@ -48,6 +49,25 @@ describe('curve engine', () => {
     const rope = deformFreeCurve(curve, grabbed, 2)
     const affectedWidth = (result: typeof curve) => result.filter((point, index) => Math.abs(point.y - curve[index].y) > 0.01).length
     expect(affectedWidth(rope)).toBeLessThan(affectedWidth(mathematical))
+  })
+
+  it('rounds the rope apex around the grabbed particle', () => {
+    const curve = createFreeCurve(item)
+    const grabbed = Math.floor(curve.length / 2)
+    const deformed = deformFreeCurve(curve, grabbed, 3)
+    const leftRise = deformed[grabbed].y - deformed[grabbed - 1].y
+    const rightRise = deformed[grabbed].y - deformed[grabbed + 1].y
+    expect(leftRise).toBeCloseTo(rightRise, 3)
+    expect(Math.abs(leftRise)).toBeLessThan(0.2)
+  })
+
+  it('does not move a disconnected segment near the rope cap', () => {
+    const curve = [
+      { x: -0.2, y: 0, segment: 0 }, { x: -0.1, y: 0, segment: 0 }, { x: 0, y: 0, segment: 0 },
+      { x: 0.1, y: 5, segment: 1 }, { x: 0.2, y: 5, segment: 1 }, { x: 0.3, y: 5, segment: 1 },
+    ]
+    const result = deformFreeCurve(curve, 2, 3)
+    expect(result.slice(3)).toEqual(curve.slice(3))
   })
 
   it.each([-8, 8])('keeps a large vertical drag local instead of moving the whole string for %s', (dy) => {
@@ -100,5 +120,20 @@ describe('curve engine', () => {
       const rightSlope = offsets[index + 1] - offsets[index]
       expect(Math.abs(rightSlope - leftSlope)).toBeLessThan(0.03)
     }
+  })
+
+  it('detects and evaluates free expression parameters', () => {
+    expect(expressionParameters('a*x^2 + b')).toEqual(['a', 'b'])
+    expect(evaluate('a*x^2 + b', 2, { a: 3, b: -1 })).toBe(11)
+    expect(expressionParameters('A*x + SIN(x)')).toEqual(['a'])
+    expect(evaluate('A*x', 2, { a: 3 })).toBe(6)
+  })
+
+  it('turns infinity state into a vertical divergence', () => {
+    const curve = createFreeCurve(item)
+    const center = Math.floor(curve.length / 2)
+    const result = curveWithInfinity(curve, [{ id: 'i', index: center, infinity: 1 }])
+    expect(result[center].y).toBe(Number.POSITIVE_INFINITY)
+    expect(result[center - 1].y).toBeGreaterThan(curve[center - 1].y + 10)
   })
 })
