@@ -4,6 +4,7 @@ import './App.css'
 type Transform = { horizontal: number; vertical: number; xScale: number; yScale: number }
 type FunctionItem = { id: string; name: string; expression: string; color: string; transform: Transform; derivative?: boolean }
 type View = { x: number; y: number; scale: number }
+type Anchor = { functionId: string; x: number; y: number }
 
 const colors = ['#e25d3d', '#176a86', '#a34d9d', '#3f7b5d']
 const initialFunctions: FunctionItem[] = [
@@ -59,8 +60,9 @@ function App() {
   const [functions, setFunctions] = useState(initialFunctions)
   const [selectedIds, setSelectedIds] = useState<string[]>(['f'])
   const [view, setView] = useState<View>({ x: 0, y: 0, scale: 54 })
-  const [notice, setNotice] = useState('直接拖动曲线即可平移函数；拖动空白处可平移画布。')
-  const [drag, setDrag] = useState<{ mode: 'pan' | 'move'; startX: number; startY: number; view: View; targetId?: string; transform?: Transform } | null>(null)
+  const [notice, setNotice] = useState('单击曲线创建白点；拖动白点会改变函数形状，拖动曲线本体则平移函数。')
+  const [anchor, setAnchor] = useState<Anchor | null>(null)
+  const [drag, setDrag] = useState<{ mode: 'pan' | 'move' | 'reshape'; startX: number; startY: number; view: View; targetId?: string; transform?: Transform; anchor?: Anchor } | null>(null)
 
   const selected = functions.filter((item) => selectedIds.includes(item.id))
   const primary = selected[0]
@@ -112,12 +114,10 @@ function App() {
       context.stroke()
       context.globalAlpha = 1
 
-      if (isSelected) {
-        const handleX = originX + view.scale
-        const input = item.transform.xScale * (1 - item.transform.horizontal)
-        const rawY = item.derivative ? derivative(item.expression)(input) : evaluate(item.expression, input)
-        const handleY = originY - (item.transform.yScale * rawY + item.transform.vertical) * view.scale
-        if (Number.isFinite(handleY) && handleY > 12 && handleY < height - 12) {
+      if (isSelected && anchor?.functionId === item.id) {
+        const handleX = originX + anchor.x * view.scale
+        const handleY = originY - anchor.y * view.scale
+        if (handleX > 12 && handleX < width - 12 && handleY > 12 && handleY < height - 12) {
           context.fillStyle = '#fffdf8'
           context.strokeStyle = item.color
           context.lineWidth = 2
@@ -125,7 +125,7 @@ function App() {
         }
       }
     })
-  }, [functions, selectedIds, view])
+  }, [anchor, functions, selectedIds, view])
 
   useEffect(() => {
     const host = hostRef.current
@@ -154,7 +154,7 @@ function App() {
     context.beginPath(); context.moveTo(x1, y1); context.lineTo(x2, y2); context.stroke()
   }
 
-  function getFunctionAt(clientX: number, clientY: number) {
+  function getCanvasPoint(clientX: number, clientY: number) {
     const host = hostRef.current
     if (!host) return undefined
     const rect = host.getBoundingClientRect()
@@ -162,7 +162,17 @@ function App() {
     const pixelY = clientY - rect.top
     const originX = rect.width / 2 + view.x
     const originY = rect.height / 2 + view.y
-    const x = (pixelX - originX) / view.scale
+    return { x: (pixelX - originX) / view.scale, y: (originY - pixelY) / view.scale, pixelX, pixelY }
+  }
+
+  function getFunctionAt(clientX: number, clientY: number) {
+    const point = getCanvasPoint(clientX, clientY)
+    if (!point) return undefined
+    const { x, pixelY } = point
+    const host = hostRef.current
+    if (!host) return undefined
+    const rect = host.getBoundingClientRect()
+    const originY = rect.height / 2 + view.y
     let closest: { item: FunctionItem; distance: number } | undefined
     for (const item of functions) {
       const input = item.transform.xScale * (x - item.transform.horizontal)
@@ -177,9 +187,29 @@ function App() {
 
   function beginCanvasDrag(event: React.PointerEvent<HTMLDivElement>) {
     event.currentTarget.setPointerCapture(event.pointerId)
+    const point = getCanvasPoint(event.clientX, event.clientY)
+    if (!point) return
+    if (anchor && Math.hypot(point.x - anchor.x, point.y - anchor.y) * view.scale < 18) {
+      const target = functions.find((item) => item.id === anchor.functionId)
+      if (target) {
+        setSelectedIds([target.id])
+        setNotice(`正在重塑 ${target.name}(x)：函数会保持经过这个白点。`)
+        setDrag({ mode: 'reshape', startX: event.clientX, startY: event.clientY, view, targetId: target.id, transform: target.transform, anchor })
+        return
+      }
+    }
     const hit = getFunctionAt(event.clientX, event.clientY)
     if (hit) {
       setSelectedIds([hit.id])
+      const previous = anchor?.functionId === hit.id ? anchor : null
+      if (!previous) {
+        const input = hit.transform.xScale * (point.x - hit.transform.horizontal)
+        const rawY = hit.derivative ? derivative(hit.expression)(input) : evaluate(hit.expression, input)
+        setAnchor({ functionId: hit.id, x: point.x, y: hit.transform.yScale * rawY + hit.transform.vertical })
+        setNotice(`已在 ${hit.name}(x) 上创建白点。拖动白点可改变函数形状。`)
+        setDrag(null)
+        return
+      }
       setNotice(`正在移动 ${hit.name}(x)：松开即可保留这个变换。`)
       setDrag({ mode: 'move', startX: event.clientX, startY: event.clientY, view, targetId: hit.id, transform: hit.transform })
       return
@@ -193,6 +223,22 @@ function App() {
     const dy = event.clientY - drag.startY
     if (drag.mode === 'pan') setView({ ...drag.view, x: drag.view.x + dx, y: drag.view.y + dy })
     if (drag.mode === 'move' && drag.transform && drag.targetId) setFunctions((current) => current.map((item) => item.id === drag.targetId ? { ...item, transform: { ...drag.transform!, horizontal: drag.transform!.horizontal + dx / drag.view.scale, vertical: drag.transform!.vertical - dy / drag.view.scale } } : item))
+    if (drag.mode === 'reshape' && drag.transform && drag.targetId && drag.anchor) {
+      const point = getCanvasPoint(event.clientX, event.clientY)
+      const target = functions.find((item) => item.id === drag.targetId)
+      if (!point || !target) return
+      const referenceX = drag.transform.horizontal
+      const referenceY = drag.transform.vertical
+      const xDistance = drag.anchor.x - referenceX
+      const nextXDistance = point.x - referenceX
+      const nextYDistance = point.y - referenceY
+      const nextXScale = Math.abs(nextXDistance) > 0.08 && Math.abs(xDistance) > 0.08 ? drag.transform.xScale * xDistance / nextXDistance : drag.transform.xScale
+      const nextInput = nextXScale * (point.x - referenceX)
+      const nextBaseValue = target.derivative ? derivative(target.expression)(nextInput) : evaluate(target.expression, nextInput)
+      const nextYScale = Math.abs(nextBaseValue) > 0.0001 ? nextYDistance / nextBaseValue : drag.transform.yScale
+      setFunctions((current) => current.map((item) => item.id === drag.targetId ? { ...item, transform: { ...drag.transform!, xScale: Math.max(-8, Math.min(8, nextXScale)), yScale: Math.max(-8, Math.min(8, nextYScale)) } } : item))
+      setAnchor({ functionId: drag.targetId, x: point.x, y: point.y })
+    }
   }
 
   function addFunction() {
