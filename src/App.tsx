@@ -2,14 +2,14 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
 
 type Transform = { horizontal: number; vertical: number; xScale: number; yScale: number }
-type FunctionItem = { id: string; name: string; expression: string; color: string; transform: Transform; derivative?: boolean }
+type PointConstraint = { id: string; x: number; y: number }
+type FunctionItem = { id: string; name: string; expression: string; color: string; transform: Transform; derivative?: boolean; anchors: PointConstraint[]; edits: PointConstraint[] }
 type View = { x: number; y: number; scale: number }
-type Anchor = { functionId: string; x: number; y: number }
 
 const colors = ['#e25d3d', '#176a86', '#a34d9d', '#3f7b5d']
 const initialFunctions: FunctionItem[] = [
-  { id: 'f', name: 'f', expression: 'x^2 - 2', color: colors[0], transform: { horizontal: 0, vertical: 0, xScale: 1, yScale: 1 } },
-  { id: 'g', name: 'g', expression: 'sin(x)', color: colors[1], transform: { horizontal: 0, vertical: 0, xScale: 1, yScale: 1 } },
+  { id: 'f', name: 'f', expression: 'x^2 - 2', color: colors[0], transform: { horizontal: 0, vertical: 0, xScale: 1, yScale: 1 }, anchors: [], edits: [] },
+  { id: 'g', name: 'g', expression: 'sin(x)', color: colors[1], transform: { horizontal: 0, vertical: 0, xScale: 1, yScale: 1 }, anchors: [], edits: [] },
 ]
 
 const expressionHelp = '支持: + - * / ^ ( ) | sin cos tan | sqrt abs | exp log | pi e'
@@ -40,7 +40,9 @@ function transformExpression(item: FunctionItem) {
   const input = xScale === 1 ? 'x' : `${format(xScale)}x`
   const shiftedInput = horizontal === 0 ? input : `(${input} ${horizontal > 0 ? '-' : '+'} ${format(Math.abs(horizontal))})`
   const scaled = yScale === 1 ? `${item.name}₀(${shiftedInput})` : `${format(yScale)}·${item.name}₀(${shiftedInput})`
-  return vertical === 0 ? scaled : `${scaled} ${vertical > 0 ? '+' : '-'} ${format(Math.abs(vertical))}`
+  const transformed = vertical === 0 ? scaled : `${scaled} ${vertical > 0 ? '+' : '-'} ${format(Math.abs(vertical))}`
+  const constraints = [...item.anchors, ...item.edits]
+  return constraints.length ? `${transformed} + 局部拟合{${constraints.map((point) => `(${format(point.x)}, ${format(point.y)})`).join(', ')}}` : transformed
 }
 
 function format(value: number) {
@@ -54,15 +56,50 @@ function derivative(expression: string) {
   }
 }
 
+function baseValue(item: FunctionItem, x: number) {
+  const input = item.transform.xScale * (x - item.transform.horizontal)
+  const rawY = item.derivative ? derivative(item.expression)(input) : evaluate(item.expression, input)
+  return item.transform.yScale * rawY + item.transform.vertical
+}
+
+function solveSystem(matrix: number[][], values: number[]) {
+  const size = values.length
+  const augmented = matrix.map((row, index) => [...row, values[index]])
+  for (let column = 0; column < size; column += 1) {
+    let pivot = column
+    for (let row = column + 1; row < size; row += 1) if (Math.abs(augmented[row][column]) > Math.abs(augmented[pivot][column])) pivot = row
+    if (Math.abs(augmented[pivot][column]) < 0.000001) return values.map(() => 0)
+    ;[augmented[column], augmented[pivot]] = [augmented[pivot], augmented[column]]
+    const divisor = augmented[column][column]
+    for (let cell = column; cell <= size; cell += 1) augmented[column][cell] /= divisor
+    for (let row = 0; row < size; row += 1) {
+      if (row === column) continue
+      const factor = augmented[row][column]
+      for (let cell = column; cell <= size; cell += 1) augmented[row][cell] -= factor * augmented[column][cell]
+    }
+  }
+  return augmented.map((row) => row[size])
+}
+
+function functionValue(item: FunctionItem, x: number) {
+  const points = [...item.anchors, ...item.edits]
+  if (!points.length) return baseValue(item, x)
+  const width = 1.2
+  const kernel = (a: number, b: number) => Math.exp(-(((a - b) / width) ** 2))
+  const weights = solveSystem(points.map((point) => points.map((other) => kernel(point.x, other.x))), points.map((point) => point.y - baseValue(item, point.x)))
+  return baseValue(item, x) + points.reduce((total, point, index) => total + weights[index] * kernel(x, point.x), 0)
+}
+
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const hostRef = useRef<HTMLDivElement>(null)
   const [functions, setFunctions] = useState(initialFunctions)
   const [selectedIds, setSelectedIds] = useState<string[]>(['f'])
   const [view, setView] = useState<View>({ x: 0, y: 0, scale: 54 })
-  const [notice, setNotice] = useState('单击曲线创建白点；拖动白点会改变函数形状，拖动曲线本体则平移函数。')
-  const [anchor, setAnchor] = useState<Anchor | null>(null)
-  const [drag, setDrag] = useState<{ mode: 'pan' | 'move' | 'reshape'; startX: number; startY: number; view: View; targetId?: string; transform?: Transform; anchor?: Anchor } | null>(null)
+  const longPress = useRef<number | null>(null)
+  const delayedMousePress = useRef<number | null>(null)
+  const [notice, setNotice] = useState('拖动曲线可局部改变形状。双击曲线，或在触屏端长按曲线，可创建多个白色经过点。')
+  const [drag, setDrag] = useState<{ mode: 'pan' | 'reshape' | 'edit'; startX: number; startY: number; view: View; targetId?: string; pointId?: string } | null>(null)
 
   const selected = functions.filter((item) => selectedIds.includes(item.id))
   const primary = selected[0]
@@ -98,9 +135,7 @@ function App() {
       let drawing = false
       for (let pixelX = 0; pixelX <= width; pixelX += 1.5) {
         const x = (pixelX - originX) / view.scale
-        const input = item.transform.xScale * (x - item.transform.horizontal)
-        const rawY = item.derivative ? derivative(item.expression)(input) : evaluate(item.expression, input)
-        const y = item.transform.yScale * rawY + item.transform.vertical
+        const y = functionValue(item, x)
         const pixelY = originY - y * view.scale
         if (!Number.isFinite(pixelY) || Math.abs(pixelY - originY) > height * 4) {
           drawing = false
@@ -114,9 +149,9 @@ function App() {
       context.stroke()
       context.globalAlpha = 1
 
-      if (isSelected && anchor?.functionId === item.id) {
+      if (isSelected) for (const anchor of item.anchors) {
         const handleX = originX + anchor.x * view.scale
-        const handleY = originY - anchor.y * view.scale
+        const handleY = originY - functionValue(item, anchor.x) * view.scale
         if (handleX > 12 && handleX < width - 12 && handleY > 12 && handleY < height - 12) {
           context.fillStyle = '#fffdf8'
           context.strokeStyle = item.color
@@ -125,7 +160,7 @@ function App() {
         }
       }
     })
-  }, [anchor, functions, selectedIds, view])
+  }, [functions, selectedIds, view])
 
   useEffect(() => {
     const host = hostRef.current
@@ -175,9 +210,7 @@ function App() {
     const originY = rect.height / 2 + view.y
     let closest: { item: FunctionItem; distance: number } | undefined
     for (const item of functions) {
-      const input = item.transform.xScale * (x - item.transform.horizontal)
-      const rawY = item.derivative ? derivative(item.expression)(input) : evaluate(item.expression, input)
-      const y = item.transform.yScale * rawY + item.transform.vertical
+      const y = functionValue(item, x)
       const curveY = originY - y * view.scale
       const distance = Math.abs(curveY - pixelY)
       if (Number.isFinite(distance) && distance < 16 && (!closest || distance < closest.distance)) closest = { item, distance }
@@ -189,32 +222,30 @@ function App() {
     event.currentTarget.setPointerCapture(event.pointerId)
     const point = getCanvasPoint(event.clientX, event.clientY)
     if (!point) return
-    if (anchor && Math.hypot(point.x - anchor.x, point.y - anchor.y) * view.scale < 18) {
-      const target = functions.find((item) => item.id === anchor.functionId)
-      if (target) {
-        setSelectedIds([target.id])
-        setNotice(`正在重塑 ${target.name}(x)：函数会保持经过这个白点。`)
-        setDrag({ mode: 'reshape', startX: event.clientX, startY: event.clientY, view, targetId: target.id, transform: target.transform, anchor })
-        return
-      }
+    for (const item of functions) for (const anchor of item.anchors) if (Math.hypot(point.x - anchor.x, point.y - functionValue(item, anchor.x)) * view.scale < 18) {
+      setSelectedIds([item.id]); setNotice(`正在移动 ${item.name}(x) 的经过点，曲线会始终通过白点。`)
+      setDrag({ mode: 'reshape', startX: event.clientX, startY: event.clientY, view, targetId: item.id, pointId: anchor.id }); return
     }
     const hit = getFunctionAt(event.clientX, event.clientY)
     if (hit) {
       setSelectedIds([hit.id])
-      const previous = anchor?.functionId === hit.id ? anchor : null
-      if (!previous) {
-        const input = hit.transform.xScale * (point.x - hit.transform.horizontal)
-        const rawY = hit.derivative ? derivative(hit.expression)(input) : evaluate(hit.expression, input)
-        setAnchor({ functionId: hit.id, x: point.x, y: hit.transform.yScale * rawY + hit.transform.vertical })
-        setNotice(`已在 ${hit.name}(x) 上创建白点。拖动白点可改变函数形状。`)
-        setDrag(null)
-        return
-      }
-      setNotice(`正在移动 ${hit.name}(x)：松开即可保留这个变换。`)
-      setDrag({ mode: 'move', startX: event.clientX, startY: event.clientY, view, targetId: hit.id, transform: hit.transform })
+      const edit = { id: `edit-${Date.now()}`, x: point.x, y: functionValue(hit, point.x) }
+      setNotice(`正在局部重塑 ${hit.name}(x)。拖到目标位置后松开。`)
+      setDrag({ mode: 'edit', startX: event.clientX, startY: event.clientY, view, targetId: hit.id, pointId: edit.id })
+      setFunctions((current) => current.map((item) => item.id === hit.id ? { ...item, edits: [...item.edits, edit] } : item))
       return
     }
     setDrag({ mode: 'pan', startX: event.clientX, startY: event.clientY, view })
+  }
+
+  function createAnchor(clientX: number, clientY: number) {
+    const point = getCanvasPoint(clientX, clientY)
+    const hit = getFunctionAt(clientX, clientY)
+    if (!point || !hit) return
+    const anchor = { id: `anchor-${Date.now()}`, x: point.x, y: functionValue(hit, point.x) }
+    setFunctions((current) => current.map((item) => item.id === hit.id ? { ...item, anchors: [...item.anchors, anchor] } : item))
+    setSelectedIds([hit.id])
+    setNotice(`已添加第 ${hit.anchors.length + 1} 个白色经过点。拖动它可重新塑形函数。`)
   }
 
   function movePointer(event: React.PointerEvent<HTMLDivElement>) {
@@ -222,28 +253,16 @@ function App() {
     const dx = event.clientX - drag.startX
     const dy = event.clientY - drag.startY
     if (drag.mode === 'pan') setView({ ...drag.view, x: drag.view.x + dx, y: drag.view.y + dy })
-    if (drag.mode === 'move' && drag.transform && drag.targetId) setFunctions((current) => current.map((item) => item.id === drag.targetId ? { ...item, transform: { ...drag.transform!, horizontal: drag.transform!.horizontal + dx / drag.view.scale, vertical: drag.transform!.vertical - dy / drag.view.scale } } : item))
-    if (drag.mode === 'reshape' && drag.transform && drag.targetId && drag.anchor) {
+    if ((drag.mode === 'reshape' || drag.mode === 'edit') && drag.targetId && drag.pointId) {
       const point = getCanvasPoint(event.clientX, event.clientY)
-      const target = functions.find((item) => item.id === drag.targetId)
-      if (!point || !target) return
-      const referenceX = drag.transform.horizontal
-      const referenceY = drag.transform.vertical
-      const xDistance = drag.anchor.x - referenceX
-      const nextXDistance = point.x - referenceX
-      const nextYDistance = point.y - referenceY
-      const nextXScale = Math.abs(nextXDistance) > 0.08 && Math.abs(xDistance) > 0.08 ? drag.transform.xScale * xDistance / nextXDistance : drag.transform.xScale
-      const nextInput = nextXScale * (point.x - referenceX)
-      const nextBaseValue = target.derivative ? derivative(target.expression)(nextInput) : evaluate(target.expression, nextInput)
-      const nextYScale = Math.abs(nextBaseValue) > 0.0001 ? nextYDistance / nextBaseValue : drag.transform.yScale
-      setFunctions((current) => current.map((item) => item.id === drag.targetId ? { ...item, transform: { ...drag.transform!, xScale: Math.max(-8, Math.min(8, nextXScale)), yScale: Math.max(-8, Math.min(8, nextYScale)) } } : item))
-      setAnchor({ functionId: drag.targetId, x: point.x, y: point.y })
+      if (!point) return
+      setFunctions((current) => current.map((item) => item.id !== drag.targetId ? item : { ...item, [drag.mode === 'reshape' ? 'anchors' : 'edits']: item[drag.mode === 'reshape' ? 'anchors' : 'edits'].map((entry) => entry.id === drag.pointId ? { ...entry, x: point.x, y: point.y } : entry) }))
     }
   }
 
   function addFunction() {
     const index = functions.length
-    const next = { id: `f${Date.now()}`, name: String.fromCharCode(102 + index), expression: 'x', color: colors[index % colors.length], transform: { horizontal: 0, vertical: 0, xScale: 1, yScale: 1 } }
+    const next = { id: `f${Date.now()}`, name: String.fromCharCode(102 + index), expression: 'x', color: colors[index % colors.length], transform: { horizontal: 0, vertical: 0, xScale: 1, yScale: 1 }, anchors: [], edits: [] }
     setFunctions([...functions, next])
     setSelectedIds([next.id])
     setNotice('已添加新函数。直接在左侧修改表达式。')
@@ -251,7 +270,7 @@ function App() {
 
   function addDerivative() {
     if (!primary) return
-    const derivativeItem: FunctionItem = { id: `d${Date.now()}`, name: `${primary.name}'`, expression: primary.expression, color: colors[functions.length % colors.length], transform: primary.transform, derivative: true }
+    const derivativeItem: FunctionItem = { id: `d${Date.now()}`, name: `${primary.name}'`, expression: primary.expression, color: colors[functions.length % colors.length], transform: primary.transform, derivative: true, anchors: [], edits: [] }
     setFunctions([...functions, derivativeItem])
     setSelectedIds([derivativeItem.id])
     setNotice(`已创建 ${primary.name} 的数值导函数。它会随原式变换同步。`)
@@ -278,7 +297,7 @@ function App() {
       </aside>
 
       <section className="canvas-area" aria-label="函数图像画布">
-        <div className="canvas-host" ref={hostRef} onPointerDown={beginCanvasDrag} onPointerMove={movePointer} onPointerUp={() => setDrag(null)} onPointerCancel={() => setDrag(null)}>
+        <div className="canvas-host" ref={hostRef} onPointerDown={(event) => { if (event.pointerType === 'mouse') { delayedMousePress.current = window.setTimeout(() => beginCanvasDrag(event), 180); return }; longPress.current = window.setTimeout(() => createAnchor(event.clientX, event.clientY), 550) }} onPointerMove={(event) => { if (delayedMousePress.current) { window.clearTimeout(delayedMousePress.current); delayedMousePress.current = null; beginCanvasDrag(event) }; if (longPress.current) { window.clearTimeout(longPress.current); longPress.current = null; beginCanvasDrag(event) }; movePointer(event) }} onPointerUp={() => { if (delayedMousePress.current) window.clearTimeout(delayedMousePress.current); delayedMousePress.current = null; if (longPress.current) window.clearTimeout(longPress.current); longPress.current = null; setDrag(null) }} onPointerCancel={() => { if (delayedMousePress.current) window.clearTimeout(delayedMousePress.current); delayedMousePress.current = null; if (longPress.current) window.clearTimeout(longPress.current); longPress.current = null; setDrag(null) }} onDoubleClick={(event) => { if (delayedMousePress.current) window.clearTimeout(delayedMousePress.current); delayedMousePress.current = null; createAnchor(event.clientX, event.clientY) }}>
           <canvas ref={canvasRef} />
           <p className="canvas-note">{notice}</p>
         </div>
