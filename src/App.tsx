@@ -62,32 +62,21 @@ function baseValue(item: FunctionItem, x: number) {
   return item.transform.yScale * rawY + item.transform.vertical
 }
 
-function solveSystem(matrix: number[][], values: number[]) {
-  const size = values.length
-  const augmented = matrix.map((row, index) => [...row, values[index]])
-  for (let column = 0; column < size; column += 1) {
-    let pivot = column
-    for (let row = column + 1; row < size; row += 1) if (Math.abs(augmented[row][column]) > Math.abs(augmented[pivot][column])) pivot = row
-    if (Math.abs(augmented[pivot][column]) < 0.000001) return values.map(() => 0)
-    ;[augmented[column], augmented[pivot]] = [augmented[pivot], augmented[column]]
-    const divisor = augmented[column][column]
-    for (let cell = column; cell <= size; cell += 1) augmented[column][cell] /= divisor
-    for (let row = 0; row < size; row += 1) {
-      if (row === column) continue
-      const factor = augmented[row][column]
-      for (let cell = column; cell <= size; cell += 1) augmented[row][cell] -= factor * augmented[column][cell]
-    }
-  }
-  return augmented.map((row) => row[size])
-}
-
 function functionValue(item: FunctionItem, x: number) {
   const points = [...item.anchors, ...item.edits]
   if (!points.length) return baseValue(item, x)
-  const width = 1.2
-  const kernel = (a: number, b: number) => Math.exp(-(((a - b) / width) ** 2))
-  const weights = solveSystem(points.map((point) => points.map((other) => kernel(point.x, other.x))), points.map((point) => point.y - baseValue(item, point.x)))
-  return baseValue(item, x) + points.reduce((total, point, index) => total + weights[index] * kernel(x, point.x), 0)
+  const radius = 1.8
+  const contributions = points.map((point) => {
+    const distance = Math.abs(x - point.x)
+    if (distance < 0.00001) return { point, weight: 1, exact: true }
+    const t = Math.max(0, 1 - distance / radius)
+    return { point, weight: t * t * (3 - 2 * t), exact: false }
+  })
+  const exact = contributions.find((entry) => entry.exact)
+  if (exact) return exact.point.y
+  const totalWeight = contributions.reduce((total, entry) => total + entry.weight, 0)
+  if (totalWeight < 0.00001) return baseValue(item, x)
+  return baseValue(item, x) + contributions.reduce((total, entry) => total + (entry.point.y - baseValue(item, entry.point.x)) * entry.weight, 0) / totalWeight
 }
 
 function App() {
@@ -96,10 +85,11 @@ function App() {
   const [functions, setFunctions] = useState(initialFunctions)
   const [selectedIds, setSelectedIds] = useState<string[]>(['f'])
   const [view, setView] = useState<View>({ x: 0, y: 0, scale: 54 })
+  const [interactionMode, setInteractionMode] = useState<'constraint' | 'freeform'>('freeform')
   const longPress = useRef<number | null>(null)
   const delayedMousePress = useRef<number | null>(null)
   const [notice, setNotice] = useState('拖动曲线可局部改变形状。双击曲线，或在触屏端长按曲线，可创建多个白色经过点。')
-  const [drag, setDrag] = useState<{ mode: 'pan' | 'reshape' | 'edit'; startX: number; startY: number; view: View; targetId?: string; pointId?: string } | null>(null)
+  const [drag, setDrag] = useState<{ mode: 'pan' | 'move' | 'reshape' | 'edit'; startX: number; startY: number; view: View; targetId?: string; pointId?: string; transform?: Transform } | null>(null)
 
   const selected = functions.filter((item) => selectedIds.includes(item.id))
   const primary = selected[0]
@@ -229,6 +219,11 @@ function App() {
     const hit = getFunctionAt(event.clientX, event.clientY)
     if (hit) {
       setSelectedIds([hit.id])
+      if (interactionMode === 'constraint') {
+        setNotice(`正在平移 ${hit.name}(x)。切换到“自由局部塑形”可拖动局部曲线。`)
+        setDrag({ mode: 'move', startX: event.clientX, startY: event.clientY, view, targetId: hit.id, transform: hit.transform })
+        return
+      }
       const edit = { id: `edit-${Date.now()}`, x: point.x, y: functionValue(hit, point.x) }
       setNotice(`正在局部重塑 ${hit.name}(x)。拖到目标位置后松开。`)
       setDrag({ mode: 'edit', startX: event.clientX, startY: event.clientY, view, targetId: hit.id, pointId: edit.id })
@@ -253,6 +248,7 @@ function App() {
     const dx = event.clientX - drag.startX
     const dy = event.clientY - drag.startY
     if (drag.mode === 'pan') setView({ ...drag.view, x: drag.view.x + dx, y: drag.view.y + dy })
+    if (drag.mode === 'move' && drag.targetId && drag.transform) setFunctions((current) => current.map((item) => item.id === drag.targetId ? { ...item, transform: { ...drag.transform!, horizontal: drag.transform!.horizontal + dx / drag.view.scale, vertical: drag.transform!.vertical - dy / drag.view.scale } } : item))
     if ((drag.mode === 'reshape' || drag.mode === 'edit') && drag.targetId && drag.pointId) {
       const point = getCanvasPoint(event.clientX, event.clientY)
       if (!point) return
@@ -266,6 +262,18 @@ function App() {
     setFunctions([...functions, next])
     setSelectedIds([next.id])
     setNotice('已添加新函数。直接在左侧修改表达式。')
+  }
+
+  function removeAnchor(anchorId: string) {
+    if (!primary) return
+    setFunctions((current) => current.map((item) => item.id === primary.id ? { ...item, anchors: item.anchors.filter((anchor) => anchor.id !== anchorId) } : item))
+    setNotice('已删除经过点。')
+  }
+
+  function clearEdits() {
+    if (!primary) return
+    setFunctions((current) => current.map((item) => item.id === primary.id ? { ...item, edits: [] } : item))
+    setNotice('已清除自由局部塑形记录，保留白色经过点。')
   }
 
   function addDerivative() {
@@ -304,14 +312,14 @@ function App() {
         <div className="floating-toolbar" aria-label="函数操作">
           <button type="button" disabled={!primary} onClick={addDerivative}>求导</button>
           <button type="button" disabled={selected.length !== 2} onClick={() => setNotice('函数组合将在下一步接入符号运算引擎。')}>组合</button>
-          <button type="button" disabled={!primary} onClick={() => setNotice('直接拖动已选曲线即可移动它。白色圆点标记了曲线的可见控制点。')}>变换</button>
+          <button type="button" disabled={!primary} onClick={() => setNotice(interactionMode === 'freeform' ? '当前为自由局部塑形：拖动曲线可改变局部形状。' : '当前为形状约束：拖动曲线将保持形状并平移。')}>变换</button>
           <button type="button" disabled={!primary} onClick={() => setNotice('分析功能将在符号引擎接入后提供。')}>分析</button>
         </div>
       </section>
 
       <aside className="inspector" aria-label="所选函数属性">
         <p className="eyebrow">当前对象</p>
-        {primary ? <><h1>{primary.name}(x)</h1><p className="expression-large">{transformExpression(primary)}</p><div className="rule" /><p className="eyebrow">图形变换</p><dl><dt>水平平移</dt><dd>{format(primary.transform.horizontal)}</dd><dt>垂直平移</dt><dd>{format(primary.transform.vertical)}</dd><dt>水平缩放</dt><dd>{format(primary.transform.xScale)}</dd><dt>垂直缩放</dt><dd>{format(primary.transform.yScale)}</dd></dl><p className="hint">直接按住曲线拖动即可平移函数；按住空白处拖动才会移动坐标系。</p></> : <p>选择一条函数查看属性。</p>}
+        {primary ? <><h1>{primary.name}(x)</h1><p className="expression-large">{transformExpression(primary)}</p><div className="rule" /><p className="eyebrow">拖拽模式</p><div className="mode-switch"><button className={interactionMode === 'constraint' ? 'active' : ''} type="button" onClick={() => { setInteractionMode('constraint'); setNotice('已切换为形状约束：拖曲线会平移整体。') }}>形状约束</button><button className={interactionMode === 'freeform' ? 'active' : ''} type="button" onClick={() => { setInteractionMode('freeform'); setNotice('已切换为自由局部塑形：拖曲线会改变局部形状。') }}>自由局部塑形</button></div><p className="hint">双击曲线或触屏长按创建经过点。经过点始终贴合曲线。</p><p className="eyebrow">经过点</p><div className="anchor-list">{primary.anchors.length ? primary.anchors.map((anchor, index) => <div key={anchor.id}><span>点 {index + 1}: ({format(anchor.x)}, {format(anchor.y)})</span><button type="button" onClick={() => removeAnchor(anchor.id)}>删除</button></div>) : <p>暂无白色经过点</p>}</div>{primary.edits.length > 0 && <button className="clear-edits" type="button" onClick={clearEdits}>清除 {primary.edits.length} 个局部塑形</button>}<div className="rule" /><p className="eyebrow">图形变换</p><dl><dt>水平平移</dt><dd>{format(primary.transform.horizontal)}</dd><dt>垂直平移</dt><dd>{format(primary.transform.vertical)}</dd></dl></> : <p>选择一条函数查看属性。</p>}
       </aside>
     </section>
   </main>
