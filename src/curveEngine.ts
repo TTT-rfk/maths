@@ -2,6 +2,7 @@ export type Transform = { horizontal: number; vertical: number; xScale: number; 
 export type Point = { x: number; y: number }
 export type PointConstraint = Point & { id: string }
 export type CurvePoint = Point & { segment: number }
+export type CurveSample = Point & { derivative: number; index: number; segment: number }
 
 export type FunctionItem = {
   id: string
@@ -10,12 +11,9 @@ export type FunctionItem = {
   color: string
   transform: Transform
   derivative?: boolean
-  anchors: PointConstraint[]
   freeCurve: CurvePoint[] | null
   freeAnchors: { id: string; index: number }[]
 }
-
-const weightCache = new Map<string, number[]>()
 
 export function evaluate(expression: string, x: number) {
   const source = expression
@@ -43,64 +41,13 @@ export function baseValue(item: FunctionItem, x: number) {
   return item.transform.yScale * rawY + item.transform.vertical
 }
 
-function compactKernel(a: number, b: number) {
-  const distance = Math.abs(a - b) / 3.6
-  if (distance >= 1) return 0
-  const tail = 1 - distance
-  return tail ** 4 * (4 * distance + 1)
-}
-
-function solveSystem(matrix: number[][], values: number[]) {
-  const size = values.length
-  const augmented = matrix.map((row, index) => [...row, values[index]])
-  for (let column = 0; column < size; column += 1) {
-    let pivot = column
-    for (let row = column + 1; row < size; row += 1) if (Math.abs(augmented[row][column]) > Math.abs(augmented[pivot][column])) pivot = row
-    if (Math.abs(augmented[pivot][column]) < 1e-9) return null
-    ;[augmented[column], augmented[pivot]] = [augmented[pivot], augmented[column]]
-    const divisor = augmented[column][column]
-    for (let cell = column; cell <= size; cell += 1) augmented[column][cell] /= divisor
-    for (let row = 0; row < size; row += 1) {
-      if (row === column) continue
-      const factor = augmented[row][column]
-      for (let cell = column; cell <= size; cell += 1) augmented[row][cell] -= factor * augmented[column][cell]
-    }
-  }
-  return augmented.map((row) => row[size])
-}
-
-export function constraintWeights(item: FunctionItem) {
-  if (!item.anchors.length) return []
-  const key = `${item.id}|${item.expression}|${item.derivative}|${Object.values(item.transform).join(',')}|${item.anchors.map((anchor) => `${anchor.x},${anchor.y}`).join(';')}`
-  const cached = weightCache.get(key)
-  if (cached) return cached
-  const weights = solveSystem(
-    item.anchors.map((anchor) => item.anchors.map((other) => compactKernel(anchor.x, other.x))),
-    item.anchors.map((anchor) => anchor.y - baseValue(item, anchor.x)),
-  ) ?? item.anchors.map(() => 0)
-  weightCache.set(key, weights)
-  if (weightCache.size > 200) weightCache.delete(weightCache.keys().next().value!)
-  return weights
-}
-
-export function constraintValue(item: FunctionItem, x: number) {
-  const weights = constraintWeights(item)
-  return baseValue(item, x) + item.anchors.reduce((sum, anchor, index) => sum + weights[index] * compactKernel(x, anchor.x), 0)
-}
-
-export function constraintExpression(item: FunctionItem, format: (value: number) => string) {
-  if (!item.anchors.length) return `${item.name}₀(x)`
-  const terms = constraintWeights(item).map((weight, index) => `${format(weight)}·K(x-${format(item.anchors[index].x)})`)
-  return `${item.name}₀(x) + ${terms.join(' + ')}`
-}
-
 export function createFreeCurve(item: FunctionItem, minX = -20, maxX = 20) {
   const step = Math.max(0.02, (maxX - minX) / 1200)
   const curve: CurvePoint[] = []
   let segment = 0
   let previousY = Number.NaN
   for (let x = minX; x <= maxX; x += step) {
-    const y = constraintValue(item, x)
+    const y = baseValue(item, x)
     if (!Number.isFinite(y)) { previousY = Number.NaN; segment += 1; continue }
     if (Number.isFinite(previousY) && Math.abs(y - previousY) > 20) segment += 1
     curve.push({ x, y, segment })
@@ -109,23 +56,72 @@ export function createFreeCurve(item: FunctionItem, minX = -20, maxX = 20) {
   return curve
 }
 
-export function deformFreeCurve(curve: CurvePoint[], grabbedIndex: number, dx: number, dy: number, pinnedIndices: number[] = []) {
-  const radius = 90
+export function deformFreeCurve(curve: CurvePoint[], grabbedIndex: number, dy: number, pinnedIndices: number[] = []) {
+  const radius = 52
   const grabbedSegment = curve[grabbedIndex].segment
-  return curve.map((point, index) => {
-    if (point.segment !== grabbedSegment) return point
-    const distance = Math.abs(index - grabbedIndex)
-    if (distance >= radius) return point
-    const t = 1 - distance / radius
-    let weight = t * t * t * (10 - 15 * t + 6 * t * t)
-    for (const pinnedIndex of pinnedIndices) {
-      const pinDistance = Math.abs(index - pinnedIndex)
-      if (pinDistance >= radius) continue
-      const pinT = pinDistance / radius
-      weight *= pinT * pinT * (3 - 2 * pinT)
+  const displacements = curve.map(() => 0)
+  const fixed = new Map<number, number>([[grabbedIndex, dy], ...pinnedIndices.map((index) => [index, 0] as const)])
+  const start = Math.max(0, grabbedIndex - radius)
+  const end = Math.min(curve.length - 1, grabbedIndex + radius)
+
+  // Position-based relaxation: neighboring particles repeatedly share displacement.
+  for (let pass = 0; pass < 140; pass += 1) {
+    const previous = [...displacements]
+    for (let index = start + 1; index < end; index += 1) {
+      if (curve[index].segment !== grabbedSegment || fixed.has(index)) continue
+      displacements[index] = previous[index] * 0.25 + (previous[index - 1] + previous[index + 1]) * 0.375
     }
-    return { ...point, x: point.x + dx * weight, y: point.y + dy * weight }
+    for (const [index, value] of fixed) displacements[index] = value
+    if (!fixed.has(start)) displacements[start] = 0
+    if (!fixed.has(end)) displacements[end] = 0
+  }
+
+  return curve.map((point, index) => ({ ...point, y: point.y + displacements[index] }))
+}
+
+export function deformConstraintCurve(curve: CurvePoint[], grabbedIndex: number, dy: number, pinnedIndices: number[] = []) {
+  const center = curve[grabbedIndex]
+  const width = 3.6
+  return curve.map((point, index) => {
+    if (point.segment !== center.segment) return point
+    const distance = Math.abs(point.x - center.x) / width
+    if (distance >= 1) return point
+    const tail = 1 - distance
+    let weight = tail ** 4 * (4 * distance + 1)
+    for (const pin of pinnedIndices) {
+      const pinDistance = Math.abs(index - pin)
+      const pinRadius = 32
+      if (pinDistance >= pinRadius) continue
+      const pinRatio = pinDistance / pinRadius
+      weight *= pinRatio * pinRatio * (3 - 2 * pinRatio)
+    }
+    return { ...point, y: point.y + dy * weight }
   })
+}
+
+export function sampleCurve(curve: CurvePoint[], x: number): CurveSample | null {
+  if (curve.length < 2) return null
+  let low = 0
+  let high = curve.length - 1
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2)
+    if (curve[middle].x < x) low = middle + 1
+    else high = middle
+  }
+  const right = Math.min(curve.length - 1, low)
+  const left = Math.max(0, right - 1)
+  if (curve[left].segment !== curve[right].segment || x < curve[left].x || x > curve[right].x) return null
+  const span = curve[right].x - curve[left].x
+  if (span <= 0) return null
+  const ratio = (x - curve[left].x) / span
+  const index = Math.abs(x - curve[left].x) < Math.abs(x - curve[right].x) ? left : right
+  const segmentDerivative = (curve[right].y - curve[left].y) / span
+  const derivativeLeft = Math.max(0, index - 1)
+  const derivativeRight = Math.min(curve.length - 1, index + 1)
+  const derivative = (ratio < 0.000001 || ratio > 0.999999) && curve[derivativeLeft].segment === curve[derivativeRight].segment
+    ? (curve[derivativeRight].y - curve[derivativeLeft].y) / (curve[derivativeRight].x - curve[derivativeLeft].x)
+    : segmentDerivative
+  return { x, y: curve[left].y + (curve[right].y - curve[left].y) * ratio, derivative, index, segment: curve[left].segment }
 }
 
 export function nearestCurvePoint(curve: CurvePoint[], x: number, y: number, scale: number) {
