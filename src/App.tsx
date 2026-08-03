@@ -16,13 +16,13 @@ type Mode = 'constraint' | 'freeform'
 type Drag =
   | { type: 'pan'; startClientX: number; startClientY: number; startView: View }
   | { type: 'anchor'; functionId: string; anchorId: string }
-  | { type: 'string'; functionId: string; index: number; startX: number; startY: number; source: CurvePoint[] }
+  | { type: 'string'; functionId: string; index: number; startX: number; startY: number; source: CurvePoint[]; pinnedIndices: number[] }
 
 const colors = ['#e25d3d', '#176a86', '#a34d9d', '#3f7b5d']
 const transform = { horizontal: 0, vertical: 0, xScale: 1, yScale: 1 }
 const initialFunctions: FunctionItem[] = [
-  { id: 'f', name: 'f', expression: 'x^2 - 2', color: colors[0], transform, anchors: [], freeCurve: null },
-  { id: 'g', name: 'g', expression: 'sin(x)', color: colors[1], transform, anchors: [], freeCurve: null },
+  { id: 'f', name: 'f', expression: 'x^2 - 2', color: colors[0], transform, anchors: [], freeCurve: null, freeAnchors: [] },
+  { id: 'g', name: 'g', expression: 'sin(x)', color: colors[1], transform, anchors: [], freeCurve: null, freeAnchors: [] },
 ]
 
 const expressionHelp = '支持: + - * / ^ ( ) | sin cos tan | sqrt abs | exp log | pi e'
@@ -36,14 +36,19 @@ function App() {
   const hostRef = useRef<HTMLDivElement>(null)
   const longPressRef = useRef<number | null>(null)
   const pressPointRef = useRef<{ x: number; y: number } | null>(null)
+  const pendingTouchStringRef = useRef<Extract<Drag, { type: 'string' }> | null>(null)
   const [functions, setFunctions] = useState(initialFunctions)
   const [selectedId, setSelectedId] = useState('f')
   const [view, setView] = useState<View>({ x: 0, y: 0, scale: 54 })
   const [mode, setMode] = useState<Mode>('constraint')
+  const [selectedPoint, setSelectedPoint] = useState<{ functionId: string; pointId: string } | null>(null)
   const [drag, setDrag] = useState<Drag | null>(null)
   const [notice, setNotice] = useState('约束模式：双击曲线或触屏长按创建白点，只有拖动白点才会改变函数。')
 
   const selected = functions.find((item) => item.id === selectedId)
+  const selectedPointAvailable = Boolean(selected && selectedPoint?.functionId === selected.id && (mode === 'constraint'
+    ? selected.anchors.some((anchor) => anchor.id === selectedPoint.pointId)
+    : selected.freeAnchors.some((anchor) => anchor.id === selectedPoint.pointId)))
 
   function toGraphPoint(clientX: number, clientY: number) {
     const host = hostRef.current
@@ -86,6 +91,19 @@ function App() {
     return null
   }
 
+  function hitFreeAnchor(clientX: number, clientY: number) {
+    if (mode !== 'freeform') return null
+    const point = toGraphPoint(clientX, clientY)
+    const item = functions.find((candidate) => candidate.id === selectedId)
+    if (!point || !item) return null
+    const curve = curveFor(item)
+    for (const anchor of item.freeAnchors) {
+      const curvePoint = curve[anchor.index]
+      if (curvePoint && Math.hypot(curvePoint.x - point.x, curvePoint.y - point.y) * view.scale <= 18) return { item, anchor, curvePoint }
+    }
+    return null
+  }
+
   const draw = useCallback((context: CanvasRenderingContext2D, width: number, height: number) => {
     const originX = width / 2 + view.x
     const originY = height / 2 + view.y
@@ -124,6 +142,12 @@ function App() {
         context.beginPath(); context.fillStyle = '#fffdf8'; context.strokeStyle = item.color; context.lineWidth = 2
         context.arc(originX + anchor.x * view.scale, originY - anchor.y * view.scale, 7, 0, Math.PI * 2); context.fill(); context.stroke()
       }
+      if (mode === 'freeform' && active) for (const anchor of item.freeAnchors) {
+        const point = curveFor(item)[anchor.index]
+        if (!point) continue
+        context.beginPath(); context.fillStyle = '#fffdf8'; context.strokeStyle = item.color; context.lineWidth = 2
+        context.arc(originX + point.x * view.scale, originY - point.y * view.scale, 7, 0, Math.PI * 2); context.fill(); context.stroke()
+      }
     }
   }, [functions, mode, selectedId, view])
 
@@ -149,12 +173,20 @@ function App() {
   }
 
   function createAnchor(clientX: number, clientY: number) {
-    if (mode !== 'constraint') return
     const point = toGraphPoint(clientX, clientY)
     const hit = hitFunction(clientX, clientY)
     if (!point || !hit) return
+    if (mode === 'freeform') {
+      if (hit.freeIndex === undefined || hit.item.freeAnchors.some((anchor) => Math.abs(anchor.index - hit.freeIndex!) < 8)) return
+      const anchor = { id: `free-anchor-${Date.now()}`, index: hit.freeIndex }
+      setFunctions((items) => items.map((item) => item.id === hit.item.id ? { ...item, freeAnchors: [...item.freeAnchors, anchor] } : item))
+      setSelectedPoint({ functionId: hit.item.id, pointId: anchor.id })
+      setSelectedId(hit.item.id); setNotice('棉线固定点已创建。拖动白点可塑形，其他白点保持固定。')
+      return
+    }
     const anchor: PointConstraint = { id: `anchor-${Date.now()}`, x: point.x, y: constraintValue(hit.item, point.x) }
     setFunctions((items) => items.map((item) => item.id === hit.item.id ? { ...item, anchors: [...item.anchors, anchor], freeCurve: null } : item))
+    setSelectedPoint({ functionId: hit.item.id, pointId: anchor.id })
     setSelectedId(hit.item.id); setNotice('白点已创建并严格附着于数学曲线。拖动白点可改变函数。')
   }
 
@@ -165,20 +197,31 @@ function App() {
       // Synthetic pointer tests and some embedded browsers do not expose an active pointer.
     }
     pressPointRef.current = { x: event.clientX, y: event.clientY }
+    const freeAnchorHit = hitFreeAnchor(event.clientX, event.clientY)
+    if (freeAnchorHit) {
+      const source = curveFor(freeAnchorHit.item)
+      setDrag({ type: 'string', functionId: freeAnchorHit.item.id, index: freeAnchorHit.anchor.index, startX: freeAnchorHit.curvePoint.x, startY: freeAnchorHit.curvePoint.y, source, pinnedIndices: freeAnchorHit.item.freeAnchors.filter((anchor) => anchor.id !== freeAnchorHit.anchor.id).map((anchor) => anchor.index) })
+      setSelectedPoint({ functionId: freeAnchorHit.item.id, pointId: freeAnchorHit.anchor.id })
+      return
+    }
     const anchorHit = hitAnchor(event.clientX, event.clientY)
     if (anchorHit) {
-      setSelectedId(anchorHit.item.id); setDrag({ type: 'anchor', functionId: anchorHit.item.id, anchorId: anchorHit.anchor.id }); return
+      setSelectedId(anchorHit.item.id); setSelectedPoint({ functionId: anchorHit.item.id, pointId: anchorHit.anchor.id }); setDrag({ type: 'anchor', functionId: anchorHit.item.id, anchorId: anchorHit.anchor.id }); return
     }
     const hit = hitFunction(event.clientX, event.clientY)
-    if (event.pointerType !== 'mouse' && mode === 'constraint' && hit) {
-      longPressRef.current = window.setTimeout(() => createAnchor(event.clientX, event.clientY), 550)
+    if (event.pointerType !== 'mouse' && hit) {
+      if (mode === 'freeform' && hit.freeIndex !== undefined) {
+        const point = toGraphPoint(event.clientX, event.clientY)!
+        pendingTouchStringRef.current = { type: 'string', functionId: hit.item.id, index: hit.freeIndex, startX: point.x, startY: point.y, source: curveFor(hit.item), pinnedIndices: hit.item.freeAnchors.map((anchor) => anchor.index) }
+      }
+      longPressRef.current = window.setTimeout(() => { pendingTouchStringRef.current = null; createAnchor(event.clientX, event.clientY) }, 550)
       setSelectedId(hit.item.id)
       return
     }
     if (mode === 'freeform' && hit && hit.freeIndex !== undefined) {
       const point = toGraphPoint(event.clientX, event.clientY)!
       const source = curveFor(hit.item)
-      setSelectedId(hit.item.id); setDrag({ type: 'string', functionId: hit.item.id, index: hit.freeIndex, startX: point.x, startY: point.y, source })
+      setSelectedId(hit.item.id); setDrag({ type: 'string', functionId: hit.item.id, index: hit.freeIndex, startX: point.x, startY: point.y, source, pinnedIndices: hit.item.freeAnchors.map((anchor) => anchor.index) })
       setNotice('自由棉线模式：位移会沿曲线自然衰减，数学表达式保持不变。'); return
     }
     if (hit) { setSelectedId(hit.item.id); setNotice('约束模式中，直接拖曲线不会修改函数；请拖白点。'); return }
@@ -188,6 +231,17 @@ function App() {
   function pointerMove(event: React.PointerEvent<HTMLDivElement>) {
     if (longPressRef.current && pressPointRef.current && Math.hypot(event.clientX - pressPointRef.current.x, event.clientY - pressPointRef.current.y) > 8) {
       window.clearTimeout(longPressRef.current); longPressRef.current = null
+      if (pendingTouchStringRef.current) {
+        const nextDrag = pendingTouchStringRef.current
+        pendingTouchStringRef.current = null
+        const point = toGraphPoint(event.clientX, event.clientY)
+        if (point) {
+          setDrag(nextDrag)
+          setNotice('正在从当前棉线形状继续拖拽。')
+          setFunctions((items) => items.map((item) => item.id === nextDrag.functionId ? { ...item, freeCurve: deformFreeCurve(nextDrag.source, nextDrag.index, point.x - nextDrag.startX, point.y - nextDrag.startY, nextDrag.pinnedIndices) } : item))
+        }
+        return
+      }
     }
     if (!drag) return
     if (drag.type === 'pan') {
@@ -208,16 +262,17 @@ function App() {
         return { ...item, anchors: item.anchors.map((anchor) => anchor.id === drag.anchorId ? { ...anchor, x: nextX, y: point.y } : anchor), freeCurve: null }
       })); return
     }
-    setFunctions((items) => items.map((item) => item.id === drag.functionId ? { ...item, freeCurve: deformFreeCurve(drag.source, drag.index, point.x - drag.startX, point.y - drag.startY) } : item))
+    setFunctions((items) => items.map((item) => item.id === drag.functionId ? { ...item, freeCurve: deformFreeCurve(drag.source, drag.index, point.x - drag.startX, point.y - drag.startY, drag.pinnedIndices) } : item))
   }
 
   function endPointer() {
     if (longPressRef.current) window.clearTimeout(longPressRef.current)
-    longPressRef.current = null; pressPointRef.current = null; setDrag(null)
+    longPressRef.current = null; pressPointRef.current = null; pendingTouchStringRef.current = null; setDrag(null)
   }
 
   function switchMode(next: Mode) {
     setMode(next)
+    setSelectedPoint(null)
     if (next === 'freeform') {
       const rect = hostRef.current?.getBoundingClientRect()
       const minX = rect ? (-rect.width / 2 - view.x) / view.scale - 20 : -20
@@ -227,24 +282,33 @@ function App() {
     } else setNotice('约束模式：只有白点可以改变数学函数；直接拖曲线不会修改。')
   }
 
+  function deleteSelectedPoint() {
+    if (!selectedPointAvailable || !selectedPoint) return
+    setFunctions((items) => items.map((item) => item.id !== selectedPoint.functionId ? item : mode === 'constraint'
+      ? { ...item, anchors: item.anchors.filter((anchor) => anchor.id !== selectedPoint.pointId), freeCurve: null }
+      : { ...item, freeAnchors: item.freeAnchors.filter((anchor) => anchor.id !== selectedPoint.pointId) }))
+    setSelectedPoint(null)
+    setNotice('已删除选中的白点。')
+  }
+
   function addFunction() {
     const index = functions.length
-    const next: FunctionItem = { id: `f${Date.now()}`, name: String.fromCharCode(102 + index), expression: 'x', color: colors[index % colors.length], transform: { ...transform }, anchors: [], freeCurve: null }
+    const next: FunctionItem = { id: `f${Date.now()}`, name: String.fromCharCode(102 + index), expression: 'x', color: colors[index % colors.length], transform: { ...transform }, anchors: [], freeCurve: null, freeAnchors: [] }
     setFunctions([...functions, next]); setSelectedId(next.id)
   }
 
   function addDerivative() {
     if (!selected) return
-    const item: FunctionItem = { id: `d${Date.now()}`, name: `${selected.name}'`, expression: selected.expression, color: colors[functions.length % colors.length], transform: { ...selected.transform }, derivative: true, anchors: [], freeCurve: null }
+    const item: FunctionItem = { id: `d${Date.now()}`, name: `${selected.name}'`, expression: selected.expression, color: colors[functions.length % colors.length], transform: { ...selected.transform }, derivative: true, anchors: [], freeCurve: null, freeAnchors: [] }
     setFunctions([...functions, item]); setSelectedId(item.id)
   }
 
   return <main className="app-shell">
     <header className="topbar"><div><span className="brand-mark">ƒ</span><strong>函数画布</strong><span className="subtitle">图形即操作</span></div><div className="topbar-actions"><button type="button" onClick={() => setView({ x: 0, y: 0, scale: 54 })}>重置视图</button><button className="primary" type="button" onClick={addFunction}>+ 新函数</button></div></header>
     <section className="workspace">
-      <aside className="function-panel" aria-label="函数列表"><div className="panel-heading"><span>表达式</span><span>{functions.length} 个对象</span></div><div className="function-list">{functions.map((item) => <article className={`function-card ${item.id === selectedId ? 'selected' : ''}`} key={item.id}><button className="function-select" type="button" onClick={() => setSelectedId(item.id)}><span style={{ background: item.color }} /><b>{item.name}</b></button><label htmlFor={`expression-${item.id}`}>{item.name}(x) =</label><input id={`expression-${item.id}`} value={item.expression} onChange={(event) => setFunctions((items) => items.map((value) => value.id === item.id ? { ...value, expression: event.target.value, anchors: [], freeCurve: null } : value))} spellCheck="false" /></article>)}</div><p className="expression-help">{expressionHelp}</p></aside>
-      <section className="canvas-area" aria-label="函数图像画布"><div className="canvas-mode-switch"><button className={mode === 'constraint' ? 'active' : ''} type="button" onClick={() => switchMode('constraint')}>1 约束</button><button className={mode === 'freeform' ? 'active' : ''} type="button" onClick={() => switchMode('freeform')}>3 棉线</button></div><div className="canvas-host" ref={hostRef} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={endPointer} onPointerCancel={endPointer} onDoubleClick={(event) => { if (!hitAnchor(event.clientX, event.clientY)) createAnchor(event.clientX, event.clientY) }}><canvas ref={canvasRef} /><p className="canvas-note">{notice}</p></div><div className="floating-toolbar"><button type="button" disabled={!selected} onClick={addDerivative}>求导</button><button type="button" disabled>组合</button><button type="button" disabled>分析</button></div></section>
-      <aside className="inspector" aria-label="所选函数属性"><p className="eyebrow">当前对象</p>{selected ? <><h1>{selected.name}(x)</h1><p className="expression-large">{mode === 'constraint' ? constraintExpression(selected, format) : `${selected.expression}（仅自由曲线显示）`}</p><div className="rule" /><p className="eyebrow">拖拽模式</p><div className="mode-switch"><button className={mode === 'constraint' ? 'active' : ''} type="button" onClick={() => switchMode('constraint')}>1 数学约束</button><button className={mode === 'freeform' ? 'active' : ''} type="button" onClick={() => switchMode('freeform')}>3 自由棉线</button></div>{mode === 'constraint' ? <><p className="hint">双击曲线或触屏长按创建白点。只有白点能改变数学图像。</p><p className="eyebrow">经过点</p><div className="anchor-list">{selected.anchors.length ? selected.anchors.map((anchor, index) => <div key={anchor.id}><span>点 {index + 1}: ({format(anchor.x)}, {format(anchor.y)})</span><button type="button" onClick={() => setFunctions((items) => items.map((item) => item.id === selected.id ? { ...item, anchors: item.anchors.filter((entry) => entry.id !== anchor.id), freeCurve: null } : item))}>删除</button></div>) : <p>暂无白点</p>}</div></> : <><p className="hint">这是独立的弹性曲线显示层，不改变函数表达式，也不使用白点。</p><button className="clear-edits" type="button" onClick={() => setFunctions((items) => items.map((item) => item.id === selected.id ? { ...item, freeCurve: createFreeCurve({ ...item, freeCurve: null }) } : item))}>恢复原函数形状</button></>}</> : <p>请选择函数。</p>}</aside>
+      <aside className="function-panel" aria-label="函数列表"><div className="panel-heading"><span>表达式</span><span>{functions.length} 个对象</span></div><div className="function-list">{functions.map((item) => <article className={`function-card ${item.id === selectedId ? 'selected' : ''}`} key={item.id}><button className="function-select" type="button" onClick={() => setSelectedId(item.id)}><span style={{ background: item.color }} /><b>{item.name}</b></button><label htmlFor={`expression-${item.id}`}>{item.name}(x) =</label><input id={`expression-${item.id}`} value={item.expression} onChange={(event) => setFunctions((items) => items.map((value) => value.id === item.id ? { ...value, expression: event.target.value, anchors: [], freeCurve: null, freeAnchors: [] } : value))} spellCheck="false" /></article>)}</div><p className="expression-help">{expressionHelp}</p></aside>
+      <section className="canvas-area" aria-label="函数图像画布"><div className="canvas-mode-switch"><button className={mode === 'constraint' ? 'active' : ''} type="button" onClick={() => switchMode('constraint')}>1 约束</button><button className={mode === 'freeform' ? 'active' : ''} type="button" onClick={() => switchMode('freeform')}>3 棉线</button><button type="button" disabled={!selectedPointAvailable} onClick={deleteSelectedPoint}>删除点</button></div><div className="canvas-host" ref={hostRef} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={endPointer} onPointerCancel={endPointer} onDoubleClick={(event) => { if (!hitAnchor(event.clientX, event.clientY)) createAnchor(event.clientX, event.clientY) }}><canvas ref={canvasRef} /><p className="canvas-note">{notice}</p></div><div className="floating-toolbar"><button type="button" disabled={!selected} onClick={addDerivative}>求导</button><button type="button" disabled>组合</button><button type="button" disabled>分析</button></div></section>
+      <aside className="inspector" aria-label="所选函数属性"><p className="eyebrow">当前对象</p>{selected ? <><h1>{selected.name}(x)</h1><p className="expression-large">{mode === 'constraint' ? constraintExpression(selected, format) : `${selected.expression}（仅自由曲线显示）`}</p><div className="rule" /><p className="eyebrow">拖拽模式</p><div className="mode-switch"><button className={mode === 'constraint' ? 'active' : ''} type="button" onClick={() => switchMode('constraint')}>1 数学约束</button><button className={mode === 'freeform' ? 'active' : ''} type="button" onClick={() => switchMode('freeform')}>3 自由棉线</button></div>{mode === 'constraint' ? <><p className="hint">双击曲线或触屏长按创建白点。只有白点能改变数学图像。</p><p className="eyebrow">经过点</p><div className="anchor-list">{selected.anchors.length ? selected.anchors.map((anchor, index) => <div key={anchor.id}><span>点 {index + 1}: ({format(anchor.x)}, {format(anchor.y)})</span><button type="button" onClick={() => setFunctions((items) => items.map((item) => item.id === selected.id ? { ...item, anchors: item.anchors.filter((entry) => entry.id !== anchor.id), freeCurve: null } : item))}>删除</button></div>) : <p>暂无白点</p>}</div></> : <><p className="hint">双击曲线或触屏长按创建棉线固定点。每次拖拽都在当前形状上继续变化。</p><p className="eyebrow">棉线固定点</p><div className="anchor-list">{selected.freeAnchors.length ? selected.freeAnchors.map((anchor, index) => <div key={anchor.id}><span>点 {index + 1}</span><button type="button" onClick={() => setFunctions((items) => items.map((item) => item.id === selected.id ? { ...item, freeAnchors: item.freeAnchors.filter((entry) => entry.id !== anchor.id) } : item))}>删除</button></div>) : <p>暂无白点</p>}</div><button className="clear-edits" type="button" onClick={() => setFunctions((items) => items.map((item) => item.id === selected.id ? { ...item, freeCurve: createFreeCurve({ ...item, freeCurve: null }), freeAnchors: [] } : item))}>恢复原函数形状</button></>}</> : <p>选择一条函数。</p>}</aside>
     </section>
   </main>
 }

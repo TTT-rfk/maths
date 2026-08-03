@@ -12,6 +12,7 @@ export type FunctionItem = {
   derivative?: boolean
   anchors: PointConstraint[]
   freeCurve: CurvePoint[] | null
+  freeAnchors: { id: string; index: number }[]
 }
 
 const weightCache = new Map<string, number[]>()
@@ -108,18 +109,21 @@ export function createFreeCurve(item: FunctionItem, minX = -20, maxX = 20) {
   return curve
 }
 
-export function deformFreeCurve(curve: CurvePoint[], grabbedIndex: number, dx: number, dy: number) {
-  const sameSegment = curve.filter((point) => point.segment === curve[grabbedIndex].segment)
-  const averageStep = sameSegment.length > 1 ? Math.abs(sameSegment.at(-1)!.x - sameSegment[0].x) / (sameSegment.length - 1) : 0.05
-  // A larger horizontal tug must influence a longer section, otherwise the string folds back.
-  const radius = Math.max(65, Math.ceil(Math.abs(dx) * 2 / Math.max(averageStep, 0.001)))
+export function deformFreeCurve(curve: CurvePoint[], grabbedIndex: number, dx: number, dy: number, pinnedIndices: number[] = []) {
+  const radius = 90
   const grabbedSegment = curve[grabbedIndex].segment
   return curve.map((point, index) => {
     if (point.segment !== grabbedSegment) return point
     const distance = Math.abs(index - grabbedIndex)
     if (distance >= radius) return point
     const t = 1 - distance / radius
-    const weight = t * t * t * (10 - 15 * t + 6 * t * t)
+    let weight = t * t * t * (10 - 15 * t + 6 * t * t)
+    for (const pinnedIndex of pinnedIndices) {
+      const pinDistance = Math.abs(index - pinnedIndex)
+      if (pinDistance >= radius) continue
+      const pinT = pinDistance / radius
+      weight *= pinT * pinT * (3 - 2 * pinT)
+    }
     return { ...point, x: point.x + dx * weight, y: point.y + dy * weight }
   })
 }
