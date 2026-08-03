@@ -3,13 +3,14 @@ import './App.css'
 
 type Transform = { horizontal: number; vertical: number; xScale: number; yScale: number }
 type PointConstraint = { id: string; x: number; y: number }
-type FunctionItem = { id: string; name: string; expression: string; color: string; transform: Transform; derivative?: boolean; anchors: PointConstraint[]; edits: PointConstraint[] }
+type FreeHandle = PointConstraint & { baseX: number; baseY: number }
+type FunctionItem = { id: string; name: string; expression: string; color: string; transform: Transform; derivative?: boolean; anchors: PointConstraint[]; freeHandles: FreeHandle[] }
 type View = { x: number; y: number; scale: number }
 
 const colors = ['#e25d3d', '#176a86', '#a34d9d', '#3f7b5d']
 const initialFunctions: FunctionItem[] = [
-  { id: 'f', name: 'f', expression: 'x^2 - 2', color: colors[0], transform: { horizontal: 0, vertical: 0, xScale: 1, yScale: 1 }, anchors: [], edits: [] },
-  { id: 'g', name: 'g', expression: 'sin(x)', color: colors[1], transform: { horizontal: 0, vertical: 0, xScale: 1, yScale: 1 }, anchors: [], edits: [] },
+  { id: 'f', name: 'f', expression: 'x^2 - 2', color: colors[0], transform: { horizontal: 0, vertical: 0, xScale: 1, yScale: 1 }, anchors: [], freeHandles: [] },
+  { id: 'g', name: 'g', expression: 'sin(x)', color: colors[1], transform: { horizontal: 0, vertical: 0, xScale: 1, yScale: 1 }, anchors: [], freeHandles: [] },
 ]
 
 const expressionHelp = '支持: + - * / ^ ( ) | sin cos tan | sqrt abs | exp log | pi e'
@@ -41,7 +42,7 @@ function transformExpression(item: FunctionItem) {
   const shiftedInput = horizontal === 0 ? input : `(${input} ${horizontal > 0 ? '-' : '+'} ${format(Math.abs(horizontal))})`
   const scaled = yScale === 1 ? `${item.name}₀(${shiftedInput})` : `${format(yScale)}·${item.name}₀(${shiftedInput})`
   const transformed = vertical === 0 ? scaled : `${scaled} ${vertical > 0 ? '+' : '-'} ${format(Math.abs(vertical))}`
-  const constraints = [...item.anchors, ...item.edits]
+  const constraints = item.anchors
   return constraints.length ? `${transformed} + 局部拟合{${constraints.map((point) => `(${format(point.x)}, ${format(point.y)})`).join(', ')}}` : transformed
 }
 
@@ -82,7 +83,7 @@ function solveSystem(matrix: number[][], values: number[]) {
 }
 
 function functionValue(item: FunctionItem, x: number) {
-  const points = [...item.anchors, ...item.edits]
+  const points = item.anchors
   if (!points.length) return baseValue(item, x)
   const radius = 2.4
   // A compact C2 radial basis is exactly interpolating but fades smoothly to zero.
@@ -95,6 +96,20 @@ function functionValue(item: FunctionItem, x: number) {
   const matrix = points.map((point, row) => points.map((other, column) => kernel(point.x, other.x) + (row === column ? 0.000001 : 0)))
   const weights = solveSystem(matrix, points.map((point) => point.y - baseValue(item, point.x)))
   return baseValue(item, x) + points.reduce((total, point, index) => total + weights[index] * kernel(x, point.x), 0)
+}
+
+function freeCurvePoint(item: FunctionItem, x: number) {
+  const baseY = baseValue(item, x)
+  if (!item.freeHandles.length) return { x, y: baseY }
+  const radius = 1.8
+  const smooth = (distance: number) => {
+    const t = Math.max(0, 1 - Math.abs(distance) / radius)
+    return t * t * t * (10 - 15 * t + 6 * t * t)
+  }
+  return item.freeHandles.reduce((point, handle) => {
+    const weight = smooth(x - handle.baseX)
+    return { x: point.x + (handle.x - handle.baseX) * weight, y: point.y + (handle.y - handle.baseY) * weight }
+  }, { x, y: baseY })
 }
 
 function App() {
@@ -143,16 +158,17 @@ function App() {
       let drawing = false
       for (let pixelX = 0; pixelX <= width; pixelX += 1.5) {
         const x = (pixelX - originX) / view.scale
-        const y = functionValue(item, x)
-        const pixelY = originY - y * view.scale
+        const point = interactionMode === 'freeform' && isSelected ? freeCurvePoint(item, x) : { x, y: functionValue(item, x) }
+        const pixelXPosition = originX + point.x * view.scale
+        const pixelY = originY - point.y * view.scale
         if (!Number.isFinite(pixelY) || Math.abs(pixelY - originY) > height * 4) {
           drawing = false
           continue
         }
         if (!drawing) {
-          context.moveTo(pixelX, pixelY)
+          context.moveTo(pixelXPosition, pixelY)
           drawing = true
-        } else context.lineTo(pixelX, pixelY)
+        } else context.lineTo(pixelXPosition, pixelY)
       }
       context.stroke()
       context.globalAlpha = 1
@@ -168,7 +184,7 @@ function App() {
         }
       }
     })
-  }, [functions, selectedIds, view])
+  }, [functions, interactionMode, selectedIds, view])
 
   useEffect(() => {
     const host = hostRef.current
@@ -218,9 +234,10 @@ function App() {
     const originY = rect.height / 2 + view.y
     let closest: { item: FunctionItem; distance: number } | undefined
     for (const item of functions) {
-      const y = functionValue(item, x)
-      const curveY = originY - y * view.scale
-      const distance = Math.abs(curveY - pixelY)
+      const curve = interactionMode === 'freeform' && selectedIds.includes(item.id) ? freeCurvePoint(item, x) : { x, y: functionValue(item, x) }
+      const curveX = (curve.x * view.scale) + (rect.width / 2 + view.x)
+      const curveY = originY - curve.y * view.scale
+      const distance = Math.hypot(curveX - point.pixelX, curveY - pixelY)
       if (Number.isFinite(distance) && distance < 16 && (!closest || distance < closest.distance)) closest = { item, distance }
     }
     return closest?.item
@@ -242,10 +259,11 @@ function App() {
         setDrag({ mode: 'move', startX: event.clientX, startY: event.clientY, view, targetId: hit.id, transform: hit.transform })
         return
       }
-      const edit = { id: `edit-${Date.now()}`, x: point.x, y: functionValue(hit, point.x) }
-      setNotice(`正在局部重塑 ${hit.name}(x)。拖到目标位置后松开。`)
+      const base = freeCurvePoint(hit, point.x)
+      const edit = { id: `free-${Date.now()}`, baseX: point.x, baseY: base.y, x: base.x, y: base.y }
+      setNotice(`正在拉动 ${hit.name}(x) 的自由曲线。函数表达式不会改变。`)
       setDrag({ mode: 'edit', startX: event.clientX, startY: event.clientY, view, targetId: hit.id, pointId: edit.id })
-      setFunctions((current) => current.map((item) => item.id === hit.id ? { ...item, edits: [...item.edits, edit] } : item))
+      setFunctions((current) => current.map((item) => item.id === hit.id ? { ...item, freeHandles: [...item.freeHandles, edit] } : item))
       return
     }
     setDrag({ mode: 'pan', startX: event.clientX, startY: event.clientY, view })
@@ -270,13 +288,13 @@ function App() {
     if ((drag.mode === 'reshape' || drag.mode === 'edit') && drag.targetId && drag.pointId) {
       const point = getCanvasPoint(event.clientX, event.clientY)
       if (!point) return
-      setFunctions((current) => current.map((item) => item.id !== drag.targetId ? item : { ...item, [drag.mode === 'reshape' ? 'anchors' : 'edits']: item[drag.mode === 'reshape' ? 'anchors' : 'edits'].map((entry) => entry.id === drag.pointId ? { ...entry, x: point.x, y: point.y } : entry) }))
+      setFunctions((current) => current.map((item) => item.id !== drag.targetId ? item : drag.mode === 'reshape' ? { ...item, anchors: item.anchors.map((entry) => entry.id === drag.pointId ? { ...entry, x: point.x, y: point.y } : entry) } : { ...item, freeHandles: item.freeHandles.map((entry) => entry.id === drag.pointId ? { ...entry, x: point.x, y: point.y } : entry) }))
     }
   }
 
   function addFunction() {
     const index = functions.length
-    const next = { id: `f${Date.now()}`, name: String.fromCharCode(102 + index), expression: 'x', color: colors[index % colors.length], transform: { horizontal: 0, vertical: 0, xScale: 1, yScale: 1 }, anchors: [], edits: [] }
+    const next = { id: `f${Date.now()}`, name: String.fromCharCode(102 + index), expression: 'x', color: colors[index % colors.length], transform: { horizontal: 0, vertical: 0, xScale: 1, yScale: 1 }, anchors: [], freeHandles: [] }
     setFunctions([...functions, next])
     setSelectedIds([next.id])
     setNotice('已添加新函数。直接在左侧修改表达式。')
@@ -290,13 +308,13 @@ function App() {
 
   function clearEdits() {
     if (!primary) return
-    setFunctions((current) => current.map((item) => item.id === primary.id ? { ...item, edits: [] } : item))
-    setNotice('已清除自由局部塑形记录，保留白色经过点。')
+    setFunctions((current) => current.map((item) => item.id === primary.id ? { ...item, freeHandles: [] } : item))
+    setNotice('已恢复函数图像显示，保留白色经过点。')
   }
 
   function addDerivative() {
     if (!primary) return
-    const derivativeItem: FunctionItem = { id: `d${Date.now()}`, name: `${primary.name}'`, expression: primary.expression, color: colors[functions.length % colors.length], transform: primary.transform, derivative: true, anchors: [], edits: [] }
+    const derivativeItem: FunctionItem = { id: `d${Date.now()}`, name: `${primary.name}'`, expression: primary.expression, color: colors[functions.length % colors.length], transform: primary.transform, derivative: true, anchors: [], freeHandles: [] }
     setFunctions([...functions, derivativeItem])
     setSelectedIds([derivativeItem.id])
     setNotice(`已创建 ${primary.name} 的数值导函数。它会随原式变换同步。`)
@@ -337,7 +355,7 @@ function App() {
 
       <aside className="inspector" aria-label="所选函数属性">
         <p className="eyebrow">当前对象</p>
-        {primary ? <><h1>{primary.name}(x)</h1><p className="expression-large">{transformExpression(primary)}</p><div className="rule" /><p className="eyebrow">拖拽模式</p><div className="mode-switch"><button className={interactionMode === 'constraint' ? 'active' : ''} type="button" onClick={() => { setInteractionMode('constraint'); setNotice('已切换为形状约束：拖曲线会平移整体。') }}>形状约束</button><button className={interactionMode === 'freeform' ? 'active' : ''} type="button" onClick={() => { setInteractionMode('freeform'); setNotice('已切换为自由局部塑形：拖曲线会改变局部形状。') }}>自由局部塑形</button></div><p className="hint">双击曲线或触屏长按创建经过点。经过点始终贴合曲线。</p><p className="eyebrow">经过点</p><div className="anchor-list">{primary.anchors.length ? primary.anchors.map((anchor, index) => <div key={anchor.id}><span>点 {index + 1}: ({format(anchor.x)}, {format(anchor.y)})</span><button type="button" onClick={() => removeAnchor(anchor.id)}>删除</button></div>) : <p>暂无白色经过点</p>}</div>{primary.edits.length > 0 && <button className="clear-edits" type="button" onClick={clearEdits}>清除 {primary.edits.length} 个局部塑形</button>}<div className="rule" /><p className="eyebrow">图形变换</p><dl><dt>水平平移</dt><dd>{format(primary.transform.horizontal)}</dd><dt>垂直平移</dt><dd>{format(primary.transform.vertical)}</dd></dl></> : <p>选择一条函数查看属性。</p>}
+        {primary ? <><h1>{primary.name}(x)</h1><p className="expression-large">{interactionMode === 'freeform' ? `${primary.expression}  (自由曲线显示中，表达式未修改)` : transformExpression(primary)}</p><div className="rule" /><p className="eyebrow">拖拽模式</p><div className="mode-switch"><button className={interactionMode === 'constraint' ? 'active' : ''} type="button" onClick={() => { setInteractionMode('constraint'); setNotice('已切换为形状约束：拖曲线会平移整体。') }}>形状约束</button><button className={interactionMode === 'freeform' ? 'active' : ''} type="button" onClick={() => { setInteractionMode('freeform'); setNotice('已切换为自由局部塑形：拖曲线会改变自由显示曲线。') }}>自由局部塑形</button></div><p className="hint">形状约束才会影响数学图像与表达式。自由局部塑形只是可编辑的棉线显示层。</p><p className="eyebrow">经过点</p><div className="anchor-list">{primary.anchors.length ? primary.anchors.map((anchor, index) => <div key={anchor.id}><span>点 {index + 1}: ({format(anchor.x)}, {format(anchor.y)})</span><button type="button" onClick={() => removeAnchor(anchor.id)}>删除</button></div>) : <p>暂无白色经过点</p>}</div>{primary.freeHandles.length > 0 && <button className="clear-edits" type="button" onClick={clearEdits}>恢复原函数图像</button>}<div className="rule" /><p className="eyebrow">图形变换</p><dl><dt>水平平移</dt><dd>{format(primary.transform.horizontal)}</dd><dt>垂直平移</dt><dd>{format(primary.transform.vertical)}</dd></dl></> : <p>选择一条函数查看属性。</p>}
       </aside>
     </section>
   </main>
