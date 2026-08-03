@@ -43,7 +43,7 @@ export function baseValue(item: FunctionItem, x: number) {
 }
 
 function compactKernel(a: number, b: number) {
-  const distance = Math.abs(a - b) / 2.4
+  const distance = Math.abs(a - b) / 3.6
   if (distance >= 1) return 0
   const tail = 1 - distance
   return tail ** 4 * (4 * distance + 1)

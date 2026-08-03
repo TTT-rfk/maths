@@ -16,6 +16,12 @@ describe('curve engine', () => {
     expect(constraintValue(item, 1)).toBeCloseTo(2, 8)
   })
 
+  it('spreads a point constraint across a broad smooth base', () => {
+    const originalAtThree = 3 ** 2 - 2
+    expect(Math.abs(constraintValue(item, 3) - originalAtThree)).toBeGreaterThan(0.1)
+    expect(constraintValue(item, 4.7)).toBeCloseTo(4.7 ** 2 - 2, 8)
+  })
+
   it('moves an elastic string in one direction without reverse bends', () => {
     const curve = createFreeCurve({ ...item, anchors: [] })
     const grabbed = Math.floor(curve.length / 2)
